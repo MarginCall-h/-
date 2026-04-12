@@ -1771,27 +1771,28 @@ async function extractPdfTextLines(pdf, maxPages=80) {
     const linesOrdered = [...byLine.entries()].sort((a,b) => b[0] - a[0]);
 
     // 2. Кластеризация X всех items + классификация каждой колонки.
-    // Берём X-начала ВСЕХ items (не только числовых), группируем в
-    // кластеры (gap ≥ 2 × avgH → новый). Затем для каждого кластера
-    // смотрим что в нём преимущественно лежит.
+    // Плотные пороги: 1.3 × avgH между кластерами (раньше было 2×)
+    // — так лучше отделяются узкие соседние числовые колонки.
     const allXs = items.map(it => it.transform[4]).sort((a,b) => a-b);
+    const COL_GAP = avgH * 1.3;
     const colStarts = [];
     if(allXs.length) {
       colStarts.push(allXs[0]);
       for(let k = 1; k < allXs.length; k++) {
-        if(allXs[k] - allXs[k-1] >= avgH * 2) colStarts.push(allXs[k]);
+        if(allXs[k] - allXs[k-1] >= COL_GAP) colStarts.push(allXs[k]);
       }
     }
-    // Функция: к какой колонке отнести item с X=x
     function colOf(x){
       let best = 0;
       for(let c = 0; c < colStarts.length; c++) {
-        if(x >= colStarts[c] - avgH * 0.5) best = c;
+        if(x >= colStarts[c] - avgH * 0.3) best = c;
         else break;
       }
       return best;
     }
     // Классифицируем каждую колонку по её содержимому по всей странице.
+    // Используем жёсткие пороги: чтобы признать колонку «note» или «code»
+    // — подавляющее большинство (80%+) её items должны быть такими.
     const NUM_PURE = /^\s*\(?-?[\d][\d \u00a0,.]{0,}\)?\s*$/;
     const colKinds = colStarts.map((_, ci) => {
       const bucket = items.filter(it => colOf(it.transform[4]) === ci);
@@ -1811,9 +1812,13 @@ async function extractPdfTextLines(pdf, maxPages=80) {
           } else big++;
         } else text++;
       }
-      if(numeric < text) return 'desc';
-      if(rsbu > numeric * 0.5) return 'code';
-      if(note > numeric * 0.6 && big < numeric * 0.3) return 'note';
+      // Если в колонке больше текста чем чисел — это desc.
+      if(numeric < text * 0.5) return 'desc';
+      // Жёсткий порог для note/code: минимум 80% чистого содержимого
+      // и мало «крупных» чисел (иначе реальный показатель 25 мог бы
+      // ошибочно классифицировать колонку как note).
+      if(rsbu >= numeric * 0.8 && big < numeric * 0.1) return 'code';
+      if(note >= numeric * 0.8 && big < numeric * 0.1) return 'note';
       return 'value';
     });
 
