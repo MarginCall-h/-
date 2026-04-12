@@ -205,6 +205,17 @@ tr:hover td{background:var(--s2)}
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js"></script>
+<!-- OCR для PDF-сканов без текстового слоя. Грузим только по требованию -->
+<script>
+window._loadTesseract = () => new Promise((resolve, reject) => {
+  if(typeof Tesseract !== 'undefined') return resolve();
+  const s = document.createElement('script');
+  s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/dist/tesseract.min.js';
+  s.onload = () => resolve();
+  s.onerror = () => reject(new Error('Не удалось загрузить tesseract.js'));
+  document.head.appendChild(s);
+});
+</script>
 </head>
 <body>
 
@@ -4738,13 +4749,90 @@ async function repParseFile(input){
       status.textContent='Формат не поддерживается. Используйте PDF, DOCX или XLSX.';
       return;
     }
-    const filled = repFillFromText(text);
+    let filled = repFillFromText(text);
+
+    // Фоллбэк: PDF без текстового слоя («скан»). Если текст слишком короткий
+    // или цифр не нашлось — предлагаем OCR.
+    const looksLikeScan = ext==='pdf' && filled===0 && text.replace(/\s/g,'').length < 300;
+    if(looksLikeScan){
+      const ok = confirm(
+        'В PDF не нашли текстового слоя — похоже, это скан.\n\n'+
+        'Запустить OCR (распознавание по изображениям)?\n'+
+        '• ~8 МБ моделей языков скачается один раз\n'+
+        '• ~15–30 сек на страницу\n'+
+        '• Распознаётся до 15 первых страниц\n\n'+
+        'Продолжить?'
+      );
+      if(ok){
+        try {
+          const ocrText = await repOcrPdf(file, (p, n, phase) => {
+            status.style.color='var(--warn)';
+            status.textContent = phase==='init'
+              ? `⏳ Загружаю OCR-модели (русский/английский)...`
+              : `⏳ OCR стр. ${p}/${n}...`;
+          });
+          filled = repFillFromText(ocrText);
+          status.style.color = filled>0 ? 'var(--green)' : 'var(--warn)';
+          status.textContent = filled>0
+            ? `✓ OCR: найдено ${filled} показателей · ${file.name}`
+            : `OCR завершён, но цифры не распознаны. Проверьте качество скана.`;
+          return;
+        } catch(e){
+          status.style.color='var(--danger)';
+          status.textContent='OCR не удался: '+e.message;
+          return;
+        }
+      }
+    }
+
     status.style.color = filled>0?'var(--green)':'var(--warn)';
     status.textContent = filled>0 ? `✓ Найдено ${filled} показателей · ${file.name}` : `Цифры не найдены · ${file.name}`;
   } catch(e){
     status.style.color='var(--danger)';
     status.textContent='Ошибка: '+e.message;
   }
+}
+
+// OCR PDF-скана: рендерим каждую страницу в canvas и прогоняем через
+// tesseract.js. Языки: русский + английский. Возвращаем склеенный текст.
+async function repOcrPdf(file, onProgress) {
+  if(typeof window._loadTesseract !== 'function') throw new Error('OCR-лоадер не инициализирован');
+  if(onProgress) onProgress(0, 0, 'init');
+  await window._loadTesseract();
+  if(typeof Tesseract === 'undefined') throw new Error('Tesseract.js недоступен');
+
+  pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({data: buf}).promise;
+
+  // Переиспользуем один worker — языковые пакеты тогда скачаются один раз.
+  const worker = await Tesseract.createWorker(['rus','eng'], 1, {
+    // прогресс загрузки моделей в статус-строку
+    logger: m => {
+      if(m.status && onProgress && m.status.includes('loading')) {
+        onProgress(0, 0, 'init');
+      }
+    }
+  });
+
+  const maxPages = Math.min(pdf.numPages, 15);
+  let allText = '';
+  try {
+    for(let i = 1; i <= maxPages; i++) {
+      if(onProgress) onProgress(i, maxPages, 'ocr');
+      const pg = await pdf.getPage(i);
+      const viewport = pg.getViewport({scale: 2}); // 2x — хороший баланс качества и скорости
+      const canvas = document.createElement('canvas');
+      canvas.width  = viewport.width;
+      canvas.height = viewport.height;
+      await pg.render({canvasContext: canvas.getContext('2d'), viewport}).promise;
+      const { data } = await worker.recognize(canvas);
+      allText += (data.text || '') + '\n';
+    }
+  } finally {
+    await worker.terminate();
+  }
+  return allText;
 }
 
 async function repExtractPdf(file){
