@@ -1706,21 +1706,19 @@ async function refreshAllPrices() {
 // repExtractPdf/repFillFromText (вкладка «Отчётность»).
 // ══════════════════════════════════════════════════════
 
-// Извлекает текст PDF как две зоны: ОПИСАНИЕ (левая часть страницы)
-// и ЗНАЧЕНИЯ (правые колонки). Алгоритм:
-//   1) items сортируются по Y (строки), внутри строки — по X.
-//   2) На странице определяется X-позиция ПЕРВОЙ числовой колонки —
-//      самая левая X-координата среди items, содержащих число вида
-//      «1 234» или «1234» (>=3 цифр). Это правая граница описания.
-//   3) В каждой логической строке PDF:
-//      • items с X < (firstNumColX - tol) склеиваются в одну фразу
-//        описания через пробел — русский текст не рвётся;
-//      • items с X >= firstNumColX склеиваются в текст с 3-пробельным
-//        разделителем между соседями с большим gap (границы колонок
-//        внутри числовой зоны).
-// Между описанием и числами ставится 3 пробела. Это не даёт разделителю
-// тысяч («2 871») склеиться с соседней колонкой («107 626») — regex
-// расчёта чисел считает ровно 1 пробел разделителем тысяч.
+// Извлекает текст PDF как таблицу. Каждая выходная строка имеет формат
+//   description \t value1 \t value2 \t ...
+// (TAB-разделённые ячейки). Алгоритм:
+//   1) items группируются в строки по Y.
+//   2) Внутри страницы определяется X первой «числовой» колонки — самая
+//      левая X среди items, которые являются чистыми числами (≥3 цифр).
+//      Используем 15-й перцентиль чтобы отсечь одиночные мелкие номера.
+//   3) В каждой строке: items с X < numColStart объединяются в ОДНО
+//      описание (через пробел) — русский текст не рвётся на отдельные
+//      ячейки. Items с X ≥ numColStart группируются в ячейки по
+//      X-gap > 1.5 × avgH (границы числовых колонок).
+//   4) Формат позволяет findVal искать ключ в cells[0] = desc и брать
+//      первое значащее число из cells[1..] = values.
 async function extractPdfTextLines(pdf, maxPages=80) {
   let out = '';
   const pages = Math.min(pdf.numPages, maxPages);
@@ -1734,10 +1732,9 @@ async function extractPdfTextLines(pdf, maxPages=80) {
 
     const heights = items.map(it => it.height || Math.abs(it.transform[3]) || 12);
     const avgH = heights.reduce((a,b)=>a+b,0) / heights.length || 12;
-    const yTol = Math.max(1.5, avgH * 0.55);
-    const colGapK = 1.8;
+    const yTol = avgH; // щедрая толерантность — cells могут быть чуть сдвинуты
 
-    // --- 1. Y-группировка в строки ---
+    // 1. Y-группировка
     const byLine = new Map();
     for(const it of items) {
       const y = it.transform[5];
@@ -1749,75 +1746,85 @@ async function extractPdfTextLines(pdf, maxPages=80) {
       if(!byLine.has(key)) byLine.set(key, []);
       byLine.get(key).push(it);
     }
-    const lines = [...byLine.entries()].sort((a,b) => b[0] - a[0]);
+    const linesOrdered = [...byLine.entries()].sort((a,b) => b[0] - a[0]);
 
-    // --- 2. X-позиция первой числовой колонки ---
-    // Берём items с чисто числовым содержимым (>=3 цифр + опц. пробелы),
-    // их левая X и есть начало числовой колонки. Таких на странице
-    // достаточно — медиана даст устойчивое значение.
-    const NUM_ONLY = /^\s*-?\(?\s*\d[\d \u00a0]{2,}[.,]?\d*\)?\s*$/;
-    const numStartXs = items
-      .filter(it => NUM_ONLY.test(it.str))
-      .map(it => it.transform[4])
-      .sort((a,b) => a-b);
-    let firstNumColX = null;
-    if(numStartXs.length >= 3) {
-      // Берём медианное значение — на случай если одна-две цифры
-      // случайно оказались левее (номер страницы и т.п.).
-      firstNumColX = numStartXs[Math.floor(numStartXs.length * 0.1)];
+    // 2. X первой числовой колонки — через кластеризацию.
+    // Собираем X-начала items, являющихся «крупными» числами (≥3 знаков).
+    // Кластеризуем их: разрыв ≥ 2 × avgH → новый кластер. Первый кластер
+    // с ≥ 3 элементами — это и есть колонка значений. Используем её
+    // левую границу (min). Одиночные выбросы (номер страницы «5 из 33»,
+    // вынесенные подписи) попадают в кластеры по 1-2 элемента и игнорятся.
+    const NUM_STRICT = /^\s*\(?-?[\d][\d \u00a0]{2,}(?:[.,]\d+)?\)?\s*$/;
+    const numericXs = items.filter(it => NUM_STRICT.test(it.str)).map(it => it.transform[4]);
+    let numColStart = null;
+    if(numericXs.length >= 3) {
+      const xs = [...numericXs].sort((a,b) => a-b);
+      const clusters = [[xs[0]]];
+      for(let k=1; k<xs.length; k++){
+        const prev = clusters[clusters.length-1];
+        if(xs[k] - prev[prev.length-1] < avgH * 2) prev.push(xs[k]);
+        else clusters.push([xs[k]]);
+      }
+      for(const c of clusters) {
+        if(c.length >= 3) { numColStart = c[0]; break; }
+      }
+      // Страховка — если почему-то не нашлось кластера ≥ 3, берём минимум
+      if(numColStart == null) numColStart = xs[0];
     }
 
-    // --- 3. Сборка строк ---
-    for(const [, lineItems] of lines) {
+    // 3. Формируем строки
+    for(const [, lineItems] of linesOrdered) {
       lineItems.sort((a,b) => a.transform[4] - b.transform[4]);
-
-      // Если первая числовая колонка найдена — используем её как границу.
-      let descPart = '';
-      let numPart = '';
-      let prevXEnd = null;
-      let inNumZone = false;
-
+      const descItems = [];
+      const valItems  = [];
       for(const it of lineItems) {
-        const x = it.transform[4];
-        const w = it.width || 0;
-        const s = it.str || '';
-        const isInNumZone = firstNumColX != null && x >= firstNumColX - avgH * 0.6;
-
-        if(!isInNumZone) {
-          // Зона описания — сливаем через пробел.
-          if(descPart && !descPart.endsWith(' ')) descPart += ' ';
-          descPart += s;
+        if(numColStart != null && it.transform[4] >= numColStart - avgH * 0.3) {
+          valItems.push(it);
         } else {
-          if(!inNumZone) {
-            inNumZone = true;
-            prevXEnd = null;
-          }
-          if(prevXEnd !== null) {
-            const gap = x - prevXEnd;
-            if(gap > avgH * colGapK) {
-              numPart += '   ';
-            } else if(gap > 0.3 * avgH) {
-              if(numPart && !numPart.endsWith(' ')) numPart += ' ';
-            }
-          }
-          numPart += s;
+          descItems.push(it);
         }
+      }
+
+      // Описание — один кусок. Любой неотрицательный gap между items
+      // превращаем в пробел (чтобы слова не слипались).
+      let desc = '';
+      let prevXEnd = null;
+      for(const it of descItems) {
+        const x = it.transform[4], w = it.width || 0;
+        if(prevXEnd != null && x >= prevXEnd && desc && !desc.endsWith(' ')) {
+          desc += ' ';
+        }
+        desc += it.str;
         prevXEnd = x + w;
       }
+      desc = desc.replace(/\s+/g,' ').trim();
 
-      let line;
-      if(firstNumColX == null) {
-        // Не нашли числовой колонки — всё в одном куске.
-        line = descPart + numPart;
-      } else {
-        // Склеиваем с 3-пробельным разделителем между описанием и числами.
-        line = descPart.trim();
-        if(numPart.trim()) {
-          if(line) line += '   ';
-          line += numPart.trim();
+      // Значения — ячейки по X-gap > 1.5 × avgH, внутри ячейки пробел
+      // между соседями с любым неотрицательным gap (внутричислительный
+      // разделитель тысяч «2 871» уцелеет — regex extractNumbersFromLine
+      // считает ровно ОДИН пробел разделителем тысяч).
+      const cells = [];
+      let curCell = '';
+      prevXEnd = null;
+      for(const it of valItems) {
+        const x = it.transform[4], w = it.width || 0;
+        if(prevXEnd != null) {
+          const gap = x - prevXEnd;
+          if(gap > 1.5 * avgH) {
+            if(curCell.trim()) cells.push(curCell.trim());
+            curCell = '';
+          } else if(gap >= 0 && curCell && !curCell.endsWith(' ')) {
+            curCell += ' ';
+          }
         }
+        curCell += it.str;
+        prevXEnd = x + w;
       }
-      if(line.trim()) out += line + '\n';
+      if(curCell.trim()) cells.push(curCell.trim());
+
+      if(desc || cells.length) {
+        out += [desc, ...cells].join('\t') + '\n';
+      }
     }
     out += '\n';
   }
@@ -1846,6 +1853,24 @@ function extractNumbersFromLine(line) {
   }
   return out;
 }
+
+// Известные коды строк РСБУ (форма 1 — баланс, форма 2 — ОФР). Для них
+// парсер может ошибочно принять сам код за значение, если в строке PDF
+// пропадёт значение справа от кода. Используется в findVal ниже для
+// защиты при выборе «значащего» числа.
+const RSBU_CODE_SET = new Set([
+  // форма 1 (баланс): активы
+  1110,1120,1130,1140,1150,1160,1170,1180,1190,1100,
+  1210,1220,1230,1240,1250,1260,1200,1600,
+  // форма 1: пассивы
+  1310,1320,1340,1350,1360,1370,1300,
+  1410,1420,1430,1450,1400,
+  1510,1520,1530,1540,1550,1500,
+  1700,
+  // форма 2: ОФР
+  2110,2120,2100,2210,2220,2200,2310,2320,2330,2340,2350,2300,
+  2410,2421,2460,2400,2510,2520,2500,
+]);
 
 // Фильтрует шум: годы (1000–2999 как 4-значные целые) и РСБУ-коды.
 // Дополнительно: выбирает «значащее» число из строки. Первый элемент в
@@ -1943,19 +1968,43 @@ async function parseAnyReport(input) {
 
     // Ищем число на строке с ключом. НЕ трогаем исходный текст глобально —
     // это сохраняет границы таблиц, где колонки разделены пробелами.
-    // Поиск значения на строке. Между колонками стоит 3 пробела, которые
-    // НЕ являются разделителем тысяч, так что extractNumbersFromLine даст
-    // отдельные числа для соседних колонок. pickPrimaryNumber пропустит
-    // маленькие префиксы (номера примечаний < 100).
+    // Поиск значения. Каждая строка — TAB-разделённые ячейки:
+    //   [desc, val1, val2, val3, ...].
+    // Ищем ключ в desc (первая ячейка); если ключ найден — берём первое
+    // число из cells[1..] с |n| ≥ 100 (это пропускает колонку номеров
+    // примечаний). Если большого числа нет — возвращаем первое найденное.
+    // Fallback: если строка не TAB-формата (DOCX/XLSX), пробуем по всей
+    // строке через pickPrimaryNumber.
     function findVal(patterns) {
       const lines = txt.split('\n');
       for (const pat of patterns) {
         const re = new RegExp(pat, 'i');
         for (const line of lines) {
-          if(!re.test(line)) continue;
-          const nums = filterMeaningfulNumbers(extractNumbersFromLine(line), {minAbs: 1});
-          const v = pickPrimaryNumber(nums);
-          if(v != null) return v;
+          const cells = line.split('\t');
+          const desc = cells[0] || '';
+          const isTabFormat = cells.length > 1;
+          const match = isTabFormat ? re.test(desc) : re.test(line);
+          if(!match) continue;
+          if(isTabFormat){
+            const cellNums = [];
+            for(let i = 1; i < cells.length; i++){
+              const nums = filterMeaningfulNumbers(extractNumbersFromLine(cells[i]), {minAbs:1});
+              if(nums.length) cellNums.push(nums[0]);
+            }
+            if(!cellNums.length) continue;
+            // Значащее число: >= 100 И не РСБУ-код. Если все значения —
+            // коды или малые — берём первое не-код, иначе первое вообще.
+            const nonCode = cellNums.filter(n => !RSBU_CODE_SET.has(Math.abs(n)));
+            const big = nonCode.find(n => Math.abs(n) >= 100);
+            if(big != null) return big;
+            if(nonCode.length) return nonCode[0];
+            return cellNums[0];
+          } else {
+            const nums = filterMeaningfulNumbers(extractNumbersFromLine(line), {minAbs:1})
+              .filter(n => !RSBU_CODE_SET.has(Math.abs(n)));
+            const v = pickPrimaryNumber(nums);
+            if(v != null) return v;
+          }
         }
       }
       return null;
@@ -5128,17 +5177,38 @@ function repFillFromText(rawText){
     if(m && m.index < earliest){ earliest = m.index; scale = s; }
   }
 
-  const sources = {}; // id → {line, value, pattern} — для отладочного лога
+  const sources = {};
   function findValTrace(patterns, traceId){
     const lines = txt.split('\n');
     for(const pat of patterns){
       const re = new RegExp(pat, 'i');
       for(const line of lines){
-        if(!re.test(line)) continue;
-        const nums = filterMeaningfulNumbers(extractNumbersFromLine(line), {minAbs:1});
-        const v = pickPrimaryNumber(nums);
+        const cells = line.split('\t');
+        const desc = cells[0] || '';
+        const isTabFormat = cells.length > 1;
+        const match = isTabFormat ? re.test(desc) : re.test(line);
+        if(!match) continue;
+        let v = null;
+        if(isTabFormat){
+          const cellNums = [];
+          for(let i = 1; i < cells.length; i++){
+            const nums = filterMeaningfulNumbers(extractNumbersFromLine(cells[i]), {minAbs:1});
+            if(nums.length) cellNums.push(nums[0]);
+          }
+          if(cellNums.length){
+            const nonCode = cellNums.filter(n => !RSBU_CODE_SET.has(Math.abs(n)));
+            const big = nonCode.find(n => Math.abs(n) >= 100);
+            if(big != null) v = big;
+            else if(nonCode.length) v = nonCode[0];
+            else v = cellNums[0];
+          }
+        } else {
+          const nums = filterMeaningfulNumbers(extractNumbersFromLine(line), {minAbs:1})
+            .filter(n => !RSBU_CODE_SET.has(Math.abs(n)));
+          v = pickPrimaryNumber(nums);
+        }
         if(v != null){
-          if(traceId) sources[traceId] = {line: line.trim(), value: v, pattern: pat};
+          if(traceId) sources[traceId] = {line: line.replace(/\t/g,' | ').trim(), value: v, pattern: pat};
           return v;
         }
       }
