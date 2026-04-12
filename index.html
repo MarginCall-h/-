@@ -1258,7 +1258,16 @@ window._loadTesseract = () => new Promise((resolve, reject) => {
           <div id="rep-np-file-status" style="font-size:.63rem;color:var(--text3)">файл не выбран</div>
         </div>
         <div style="margin-top:6px;font-size:.56rem;color:var(--text3)" id="rep-lib-status"></div>
-        <div id="rep-np-parse-log" style="display:none;margin-top:8px;font-size:.62rem;line-height:1.8;color:var(--text2);max-height:100px;overflow-y:auto"></div>
+        <div id="rep-np-scale-wrap" style="display:none;margin-top:8px;padding:8px;background:var(--s1);border:1px solid var(--border)">
+          <div style="font-size:.58rem;letter-spacing:.08em;text-transform:uppercase;color:var(--text3);margin-bottom:5px">Единицы исходных чисел в файле <span id="rep-np-scale-auto-note" style="color:var(--text2);text-transform:none;letter-spacing:0"></span></div>
+          <div style="display:flex;gap:4px;flex-wrap:wrap">
+            <label style="font-size:.65rem;display:inline-flex;gap:4px;align-items:center;cursor:pointer"><input type="radio" name="rep-np-scale" value="auto" checked onchange="repChangeScale()"> авто</label>
+            <label style="font-size:.65rem;display:inline-flex;gap:4px;align-items:center;cursor:pointer"><input type="radio" name="rep-np-scale" value="1" onchange="repChangeScale()"> в млрд ₽</label>
+            <label style="font-size:.65rem;display:inline-flex;gap:4px;align-items:center;cursor:pointer"><input type="radio" name="rep-np-scale" value="0.001" onchange="repChangeScale()"> в млн ₽</label>
+            <label style="font-size:.65rem;display:inline-flex;gap:4px;align-items:center;cursor:pointer"><input type="radio" name="rep-np-scale" value="0.000001" onchange="repChangeScale()"> в тыс. ₽</label>
+          </div>
+        </div>
+        <div id="rep-np-parse-log" style="display:none;margin-top:8px;font-size:.62rem;line-height:1.8;color:var(--text2);max-height:180px;overflow-y:auto"></div>
         <div id="rep-np-raw-wrap" style="display:none;margin-top:8px">
           <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
             <button type="button" class="btn btn-sm" onclick="repToggleRawText()" id="rep-np-raw-btn">📄 Показать распознанный текст</button>
@@ -4975,6 +4984,11 @@ function repNewPeriodModal(){
   if(rawArea){ rawArea.value=''; rawArea.style.display='none'; }
   const rawBtn = document.getElementById('rep-np-raw-btn');
   if(rawBtn) rawBtn.textContent = '📄 Показать распознанный текст';
+  const scaleWrap = document.getElementById('rep-np-scale-wrap');
+  if(scaleWrap) scaleWrap.style.display='none';
+  const autoRadio = document.querySelector('input[name="rep-np-scale"][value="auto"]');
+  if(autoRadio) autoRadio.checked = true;
+  window._lastParsedText = '';
   // Show library status
   const libEl=document.getElementById('rep-lib-status');
   if(libEl){
@@ -5018,6 +5032,16 @@ function repSavePeriod(){
 // «📄 Показать распознанный текст» под логом парсинга.
 window._lastParsedText = '';
 
+// При смене radio-переключателя единиц заново пересчитываем поля из
+// того же текста — это быстрее чем перечитывать файл.
+function repChangeScale(){
+  if(!window._lastParsedText) return;
+  const sel = document.querySelector('input[name="rep-np-scale"]:checked');
+  const val = sel ? sel.value : 'auto';
+  const override = val === 'auto' ? null : parseFloat(val);
+  repFillFromText(window._lastParsedText, override);
+}
+
 async function repParseFile(input){
   const file=input.files[0]; if(!file) return;
   const status=document.getElementById('rep-np-file-status');
@@ -5041,12 +5065,15 @@ async function repParseFile(input){
       return;
     }
     window._lastParsedText = text;
-    // Показываем кнопку «распознанный текст» — пользователь сможет
-    // посмотреть или скопировать для отладки.
     const rawWrap = document.getElementById('rep-np-raw-wrap');
     const rawArea = document.getElementById('rep-np-raw-text');
     if(rawWrap) rawWrap.style.display = 'block';
     if(rawArea) rawArea.value = text;
+    const scaleWrap = document.getElementById('rep-np-scale-wrap');
+    if(scaleWrap) scaleWrap.style.display = 'block';
+    // Сбрасываем radio на «авто» при новой загрузке.
+    const autoRadio = document.querySelector('input[name="rep-np-scale"][value="auto"]');
+    if(autoRadio) autoRadio.checked = true;
     let filled = repFillFromText(text);
 
     // Фоллбэк: PDF без текстового слоя («скан»). Если текст слишком короткий
@@ -5162,30 +5189,40 @@ async function repExtractXlsx(file){
   return text;
 }
 
-function repFillFromText(rawText){
-  const txt = rawText || '';
-  // Выбираем масштаб по наиболее частому упоминанию (см. комментарий в
-  // parseAnyReport). Защищаемся от случайного «тыс.» в юр. блоке о
-  // номинале акции / уставном капитале, которое иначе подменяло бы
-  // масштаб всего документа в тысячах.
+// Определение масштаба по тексту документа. Возвращает самый частый
+// маркер; при равных частотах — приоритет у «миллионов» (типичный
+// масштаб российской МСФО-отчётности). null — если в тексте вообще
+// нет маркеров единиц.
+function detectScaleByText(txt){
   const SCALE_RES = [
-    {re: /в\s+миллиардах\s+рубл/gi,   s: 1},
-    {re: /\(\s*млрд\.?\s*руб/gi,      s: 1},
-    {re: /в\s+миллионах\s+рубл/gi,    s: 0.001},
-    {re: /\(\s*млн\.?\s*руб/gi,       s: 0.001},
-    {re: /миллионах\s+росс/gi,        s: 0.001},
-    {re: /в\s+тысячах\s+рубл/gi,      s: 0.000001},
-    {re: /\(\s*тыс\.?\s*руб/gi,       s: 0.000001},
+    {re: /в\s+миллиардах\s+рубл/gi,          s: 1},
+    {re: /(?:^|[\s(])млрд\.?\s*руб/gi,       s: 1},
+    {re: /в\s+миллионах\s+рубл/gi,           s: 0.001},
+    {re: /(?:^|[\s(])млн\.?\s*руб/gi,        s: 0.001},
+    {re: /миллионах\s+росс/gi,               s: 0.001},
+    {re: /в\s+тысячах\s+рубл/gi,             s: 0.000001},
+    {re: /(?:^|[\s(])тыс\.?\s*руб/gi,        s: 0.000001},
   ];
-  const scaleCounts = {'1':0, '0.001':0, '0.000001':0};
+  const counts = {'1':0,'0.001':0,'0.000001':0};
   for(const {re, s} of SCALE_RES){
-    const matches = txt.match(re);
-    if(matches) scaleCounts[String(s)] += matches.length;
+    const m = txt.match(re);
+    if(m) counts[String(s)] += m.length;
   }
-  let scale = 1, best = 0;
-  for(const [s, c] of Object.entries(scaleCounts)){
-    if(c > best){ best = c; scale = parseFloat(s); }
-  }
+  if(counts['1']===0 && counts['0.001']===0 && counts['0.000001']===0) return null;
+  // Победитель — с наибольшим счётчиком; при равном — миллионы.
+  const order = ['0.001','1','0.000001'];
+  let winner = order[0];
+  for(const k of order) if(counts[k] > counts[winner]) winner = k;
+  return parseFloat(winner);
+}
+
+function repFillFromText(rawText, scaleOverride){
+  const txt = rawText || '';
+
+  // Сначала ищем значения в сыром виде (scale=1), потом выбираем
+  // реальный scale двумя путями: текст + величина чисел. Пользователь
+  // может вручную задать scaleOverride.
+  let scale = 1;
 
   const sources = {};
   function findValTrace(patterns, traceId){
@@ -5226,22 +5263,33 @@ function repFillFromText(rawText){
     return null;
   }
   const findVal = (pats) => findValTrace(pats);
-  const sc=v=>v!=null?parseFloat((v*scale).toFixed(6)):null;
 
-  const map={
-    'rep-np-rev':   sc(findValTrace(['Выручка по договорам','Выручка от реализации','Итого выручк[а-яё]*','^\\s*Выручка\\b','Доходы от реализации','Revenue'], 'rep-np-rev')),
-    'rep-np-ebitda':sc(findValTrace(['EBITDA','Прибыль до вычета процентов','ЕБИТДА'], 'rep-np-ebitda')),
-    'rep-np-ebit':  sc(findValTrace(['Операционная прибыль','Прибыль от продаж','EBIT'], 'rep-np-ebit')),
-    'rep-np-np':    sc(findValTrace(['Чистая прибыль','Итого чистая прибыль','Прибыль за период','Прибыль за отчетн','Net profit','Profit for the period'], 'rep-np-np')),
-    'rep-np-int':   sc(findValTrace(['Проценты к уплате','Процентные расходы','Расходы по процентам','Финансовые расходы','Finance costs'], 'rep-np-int')),
-    'rep-np-assets':sc(findValTrace(['Итого активы','Итого активов','Совокупные активы','Всего активов','Total assets','ИТОГО АКТИВЫ','БАЛАНС'], 'rep-np-assets')),
-    'rep-np-ca':    sc(findValTrace(['Итого оборотн[а-яё]*\\s+активов','Итого оборотных','Оборотные активы','Total current assets','Current assets'], 'rep-np-ca')),
-    'rep-np-cl':    sc(findValTrace(['Итого краткосрочн[а-яё]*\\s+обязательств','Итого краткосрочных','Краткосрочные обязательства','Total current liabilities','Current liabilities'], 'rep-np-cl')),
-    'rep-np-debt':  sc(findValTrace(['Заемные средства','Кредиты и займы','Total borrowings'], 'rep-np-debt')),
-    'rep-np-cash':  sc(findValTrace(['Денежные средства и (их )?эквивалент','Cash and cash equivalents','ДС и их эквивалент'], 'rep-np-cash')),
-    'rep-np-ret':   sc(findValTrace(['Нераспредел[её]нная прибыль','Retained earnings'], 'rep-np-ret')),
-    'rep-np-eq':    sc(findValTrace(['Итого капитал','Итого собственн[а-яё]*\\s+капитал','Собственный капитал','Total equity','ИТОГО КАПИТАЛ'], 'rep-np-eq')),
+  // 1. Собираем сырые значения (без применения scale).
+  const rawMap = {
+    'rep-np-rev':   findValTrace(['Выручка по договорам','Выручка от реализации','Итого выручк[а-яё]*','^\\s*Выручка\\b','Доходы от реализации','Revenue'], 'rep-np-rev'),
+    'rep-np-ebitda':findValTrace(['EBITDA','Прибыль до вычета процентов','ЕБИТДА'], 'rep-np-ebitda'),
+    'rep-np-ebit':  findValTrace(['Операционная прибыль','Прибыль от продаж','EBIT'], 'rep-np-ebit'),
+    'rep-np-np':    findValTrace(['Чистая прибыль','Итого чистая прибыль','Прибыль за период','Прибыль за отчетн','Net profit','Profit for the period'], 'rep-np-np'),
+    'rep-np-int':   findValTrace(['Проценты к уплате','Процентные расходы','Расходы по процентам','Финансовые расходы','Finance costs'], 'rep-np-int'),
+    'rep-np-assets':findValTrace(['Итого активы','Итого активов','Совокупные активы','Всего активов','Total assets','ИТОГО АКТИВЫ','БАЛАНС'], 'rep-np-assets'),
+    'rep-np-ca':    findValTrace(['Итого оборотн[а-яё]*\\s+активов','Итого оборотных','Оборотные активы','Total current assets','Current assets'], 'rep-np-ca'),
+    'rep-np-cl':    findValTrace(['Итого краткосрочн[а-яё]*\\s+обязательств','Итого краткосрочных','Краткосрочные обязательства','Total current liabilities','Current liabilities'], 'rep-np-cl'),
+    'rep-np-debt':  findValTrace(['Заемные средства','Кредиты и займы','Total borrowings'], 'rep-np-debt'),
+    'rep-np-cash':  findValTrace(['Денежные средства и (их )?эквивалент','Cash and cash equivalents','ДС и их эквивалент'], 'rep-np-cash'),
+    'rep-np-ret':   findValTrace(['Нераспредел[её]нная прибыль','Retained earnings'], 'rep-np-ret'),
+    'rep-np-eq':    findValTrace(['Итого капитал','Итого собственн[а-яё]*\\s+капитал','Собственный капитал','Total equity','ИТОГО КАПИТАЛ'], 'rep-np-eq'),
   };
+
+  // 2. Определяем scale. Сначала override пользователя, затем текстовый
+  // детектор, иначе — значение по умолчанию «млн ₽» (типичный масштаб
+  // российских МСФО-отчётов).
+  const scaleAuto = detectScaleByText(txt);
+  scale = scaleOverride != null ? scaleOverride : (scaleAuto != null ? scaleAuto : 0.001);
+
+  // 3. Применяем scale.
+  const sc=v=>v!=null?parseFloat((v*scale).toFixed(6)):null;
+  const map = {};
+  for(const [k, v] of Object.entries(rawMap)) map[k] = sc(v);
   const log=document.getElementById('rep-np-parse-log');
   const labels = {
     'rep-np-rev':'Выручка','rep-np-ebitda':'EBITDA','rep-np-ebit':'EBIT',
@@ -5277,7 +5325,18 @@ function repFillFromText(rawText){
   }
   if(logLines.length){
     log.style.display='block';
-    log.innerHTML = `<div style="color:var(--text3);font-size:.55rem;margin-bottom:4px">Масштаб: ${scale===1?'млрд ₽':scale===0.001?'млн ₽ → млрд':'тыс. ₽ → млрд'}</div>` + logLines.join('');
+    const scaleName = scale===1 ? 'млрд ₽' : scale===0.001 ? 'млн ₽ → млрд' : 'тыс. ₽ → млрд';
+    const howChosen = scaleOverride != null ? 'вручную' :
+      (scaleAuto != null ? 'авто: по тексту' : 'по умолчанию (млн)');
+    log.innerHTML = `<div style="color:var(--text3);font-size:.55rem;margin-bottom:4px">Масштаб: <strong style="color:var(--acc)">${scaleName}</strong> · ${howChosen}. Если неверно — переключите над этим блоком.</div>` + logLines.join('');
+  }
+  // Информация о scale в over-UI: подсказка рядом с radio.
+  const note = document.getElementById('rep-np-scale-auto-note');
+  if(note && scaleOverride == null) {
+    const ss = scale===1 ? 'млрд' : scale===0.001 ? 'млн' : 'тыс.';
+    note.textContent = ' · авто: ' + ss;
+  } else if(note) {
+    note.textContent = ' · выбрано вручную';
   }
   return filled;
 }
