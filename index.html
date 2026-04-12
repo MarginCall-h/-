@@ -1693,6 +1693,115 @@ async function refreshAllPrices() {
 
 // ══ PDF PARSER ══
 // Универсальная функция — определяет тип файла и парсит нужным способом
+// ══════════════════════════════════════════════════════
+// Общие хелперы парсинга отчётности (PDF/DOCX/XLSX).
+// Используются и parseAnyReport (вкладка «Эмитент»), и
+// repExtractPdf/repFillFromText (вкладка «Отчётность»).
+// ══════════════════════════════════════════════════════
+
+// Достаёт текст PDF с сохранением строк и колонок таблиц. pdf.js даёт
+// TextContent-item'ы с координатами transform=[a,b,c,d,x,y] и width.
+// Группируем по Y (строки) и ставим несколько пробелов между item'ами,
+// если между ними большой горизонтальный разрыв — иначе соседние
+// колонки таблицы склеиваются в одно длинное «число».
+async function extractPdfTextLines(pdf, maxPages=80) {
+  let out = '';
+  const pages = Math.min(pdf.numPages, maxPages);
+  for(let i = 1; i <= pages; i++) {
+    let page;
+    try { page = await pdf.getPage(i); } catch(e){ continue; }
+    let content;
+    try { content = await page.getTextContent(); } catch(e){ continue; }
+    const items = content.items || [];
+    let prevY = null, prevXEnd = null, prevH = 12;
+    let line = '';
+    for(const it of items) {
+      const tr = it.transform || [];
+      const x = tr[4], y = tr[5];
+      const h = it.height || Math.abs(tr[3]) || 12;
+      const w = it.width || 0;
+      const s = (it.str || '');
+      // Новая строка: скачок по Y больше половины высоты шрифта.
+      if(prevY !== null && y !== null && Math.abs(y - prevY) > Math.max(2, h*0.5)) {
+        if(line.trim()) out += line.trim() + '\n';
+        line = '';
+        prevXEnd = null;
+      }
+      if(prevXEnd !== null && x !== null) {
+        const gap = x - prevXEnd;
+        // Порог: разрыв больше 40% высоты шрифта ≈ несколько space-width.
+        // Типичная пробельная ширина — 0.25-0.35 высоты. 40% = 1 или более
+        // пробелов, что означает колонку таблицы или табуляцию.
+        if(gap > h * 0.4) {
+          // Большой gap — вставляем ТРИ пробела (этого достаточно чтобы
+          // extractNumbersFromLine не счёл соседнее число разделителем
+          // тысяч, который требует ровно одного пробела).
+          if(line && !line.endsWith(' ')) line += '   ';
+          else line += '  ';
+        } else if(line && !line.endsWith(' ')) {
+          line += ' '; // обычная граница слов/внутри числа («22 242»)
+        }
+      }
+      line += s;
+      if(y !== null) prevY = y;
+      if(x !== null) prevXEnd = x + w;
+      prevH = h;
+    }
+    if(line.trim()) out += line.trim() + '\n';
+    out += '\n';
+  }
+  return out;
+}
+
+// Выделяет все числа из строки, уважая русский разделитель тысяч (пробел
+// между группами ровно 3 цифр) и НЕ склеивая соседние колонки таблицы.
+// Отрицательные числа в скобках "(1 234)" конвертируются в "-1234".
+function extractNumbersFromLine(line) {
+  if(!line) return [];
+  // Скобочные отрицательные: (1 234) → -1234. Разрешаем пробелы/минус/цифры.
+  line = line.replace(/\(\s*(-?[\d \u00a0]+(?:[.,]\d+)?)\s*\)/g, (m, n) => {
+    return '-' + n.replace(/[\s\u00a0]/g,'');
+  });
+  // Число либо с разделителями тысяч (1-3 цифры + хотя бы одна группа
+  // " 3 цифры"), либо монолитное (4+ цифр или дробное). Для обоих случаев
+  // опциональный знак минус.
+  const RE = /-?(?:\d{1,3}(?:[ \u00a0]\d{3})+|\d+)(?:[.,]\d+)?/g;
+  const out = [];
+  let m;
+  while((m = RE.exec(line)) !== null) {
+    const raw = m[0].replace(/[ \u00a0]/g,'').replace(',','.');
+    const n = parseFloat(raw);
+    if(!isNaN(n)) out.push(n);
+  }
+  return out;
+}
+
+// Фильтрует шум: годы (1000–2999 как 4-значные целые) и РСБУ-коды.
+// Дополнительно: выбирает «значащее» число из строки. Первый элемент в
+// табличной строке часто — номер примечания (1–2 цифры), его нужно
+// пропустить если дальше в строке есть большие числа.
+function filterMeaningfulNumbers(nums, {minAbs=0} = {}) {
+  // Исторически тут отсекались 4-значные целые 1000-2999 как «годы/коды»,
+  // но в МСФО отчётах настоящие значения (млн ₽) часто попадают в этот
+  // диапазон (чистая прибыль 2 871, EBITDA 1 765 и т.п.) — фильтр давал
+  // ложные срабатывания. Защиту от кодов РСБУ даёт уже extractByRsbuCodes
+  // (он знает конкретный код и исключает ровно его), а защиту от
+  // номеров примечаний (1-99 в начале строки) делает pickPrimaryNumber.
+  return nums.filter(n => Math.abs(n) >= minAbs);
+}
+
+// Выбрать «первое значащее» число из строки: если в строке несколько
+// чисел и первое выглядит как номер примечания (|n|<100), пропустить его
+// и вернуть следующее большое. Одиночные числа возвращаем как есть.
+function pickPrimaryNumber(nums) {
+  if(!nums.length) return null;
+  if(nums.length === 1) return nums[0];
+  for(const n of nums) {
+    if(Math.abs(n) >= 100) return n; // первое «взрослое» число
+  }
+  return nums[0];
+}
+
 async function parseAnyReport(input) {
   const file = input.files[0];
   if (!file) return;
@@ -1711,21 +1820,12 @@ async function parseAnyReport(input) {
       await _ensurePdfjs();
       pdfjsLib.GlobalWorkerOptions.workerSrc =
         'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-      // Читаем буфер один раз и передаём копию в pdf.js
       const rawBuf = await file.arrayBuffer();
-      const buf = rawBuf.slice(0); // копия — оригинал detach'ится после передачи
+      const buf = rawBuf.slice(0);
       let pdf;
       try { pdf = await pdfjsLib.getDocument({ data: buf }).promise; }
       catch(e) { pdf = await pdfjsLib.getDocument({ data: rawBuf.slice(0), stopAtErrors: false }).promise; }
-      let fullText = '';
-      for (let i = 1; i <= Math.min(pdf.numPages, 80); i++) {
-        try {
-          const pg = await pdf.getPage(i);
-          const ct = await pg.getTextContent();
-          fullText += ct.items.map(s => s.str).join(' ') + '\n';
-        } catch(e) {}
-      }
-      txt = fullText;
+      txt = await extractPdfTextLines(pdf, 80);
 
     } else if (ext === 'docx' || ext === 'doc') {
       // ── DOCX ──
@@ -1750,35 +1850,30 @@ async function parseAnyReport(input) {
     }
 
     // ── Общий парсинг ──
-    // Для XLSX используем структурированный поиск по ячейкам
-    // Для PDF/DOCX — текстовый поиск
-
-    // Определяем масштаб ДО замены пробелов
+    // Масштаб определяем СТРОГО по заголовку — первые 3000 символов,
+    // чтобы случайное упоминание «тыс.» в примечании не сломало шкалу.
     let scale = 1;
-    const txtRaw = txt;
-    if (/тыс[\s\S]{0,20}руб/i.test(txtRaw) || /руб[\s\S]{0,5}тыс/i.test(txtRaw) || /в тысячах/i.test(txtRaw)) {
+    const head = txt.slice(0, 3000);
+    if (/в\s+тысячах\s+рубл/i.test(head) || /\(тыс\.?\s*руб/i.test(head)) {
       scale = 0.000001; // тыс.руб → млрд
-    } else if (/млн[\s\S]{0,10}руб/i.test(txtRaw) || /в миллионах/i.test(txtRaw)) {
-      scale = 0.001; // млн.руб → млрд
+    } else if (/в\s+миллионах\s+рубл/i.test(head) || /\(млн\.?\s*руб/i.test(head) ||
+               /миллионах\s+росс/i.test(head)) {
+      scale = 0.001;    // млн.руб → млрд
+    } else if (/в\s+миллиардах\s+рубл/i.test(head) || /\(млрд\.?\s*руб/i.test(head)) {
+      scale = 1;
     }
 
-    // Очищаем пробелы внутри чисел
-    txt = txt.replace(/(\d)[ \u00a0\t]{1,3}(\d)/g, '$1$2');
-    // Заменяем скобки вокруг чисел на минус: (1234) → -1234
-    txt = txt.replace(/\((\d[\d\s]{1,20})\)/g, (m, n) => '-' + n.replace(/\s/g,''));
-
-    // Ищем первое большое число после ключевого слова (текущий год = левая колонка)
+    // Ищем число на строке с ключом. НЕ трогаем исходный текст глобально —
+    // это сохраняет границы таблиц, где колонки разделены пробелами.
     function findVal(patterns) {
+      const lines = txt.split('\n');
       for (const pat of patterns) {
-        const re = new RegExp(pat + '[^\\n]{0,300}', 'gi');
-        let m;
-        while ((m = re.exec(txt)) !== null) {
-          const line = m[0];
-          // Все числа ≥ 4 цифр в строке (исключаем коды строк вида 21xx, 24xx — 4 цифры начинающиеся с 2)
-          const nums = [...line.matchAll(/[-]?\d{4,}/g)]
-            .map(n => parseFloat(n[0]))
-            .filter(n => !isNaN(n) && Math.abs(n) >= 1000 && !(n >= 2000 && n <= 2999));
-          if (nums.length > 0) return nums[0]; // первое = текущий год
+        const re = new RegExp(pat, 'i');
+        for (const line of lines) {
+          if(!re.test(line)) continue;
+          const nums = filterMeaningfulNumbers(extractNumbersFromLine(line), {minAbs: 1});
+          const v = pickPrimaryNumber(nums);
+          if (v != null) return v; // левая колонка = текущий период
         }
       }
       return null;
@@ -1802,19 +1897,19 @@ async function parseAnyReport(input) {
     const sc = v => v !== null ? parseFloat((v * scale).toFixed(6)) : null;
     const alreadyFilled = new Set(Object.keys(codeResults).filter(k=>codeResults[k]!=null));
     const fields = {
-      'is-rev':    alreadyFilled.has('is-rev')    ? null : sc(findVal(['Выручка','Доходы от реализации','Итого выручка','Revenue'])),
+      'is-rev':    alreadyFilled.has('is-rev')    ? null : sc(findVal(['Выручка по договорам','Выручка от реализации','Итого выручк\\w*','^\\s*Выручка\\b','Доходы от реализации','Revenue'])),
       'is-ebitda': sc(findVal(['EBITDA','Прибыль до вычета процентов','ЕБИТДА'])),
       'is-ebit':   alreadyFilled.has('is-ebit')   ? null : sc(findVal(['Операционная прибыль','Прибыль от продаж','EBIT'])),
-      'is-np':     alreadyFilled.has('is-np')     ? null : sc(findVal(['Чистая прибыль','Итого чистая прибыль','Прибыль за период','Net profit'])),
-      'is-int':    alreadyFilled.has('is-int')    ? null : sc(findVal(['Проценты к уплате','Процентные расходы','Расходы по процентам','Finance costs'])),
+      'is-np':     alreadyFilled.has('is-np')     ? null : sc(findVal(['Чистая прибыль','Итого чистая прибыль','Прибыль за период','Прибыль за отчетн','Net profit','Profit for the period'])),
+      'is-int':    alreadyFilled.has('is-int')    ? null : sc(findVal(['Проценты к уплате','Процентные расходы','Расходы по процентам','Финансовые расходы','Finance costs'])),
       'is-tax':    alreadyFilled.has('is-tax')    ? null : sc(findVal(['Налог на прибыль','Расход по налогу','Income tax'])),
-      'is-assets': alreadyFilled.has('is-assets') ? null : sc(findVal(['Итого активы','Совокупные активы','Всего активов','Total assets','ИТОГО АКТИВЫ','БАЛАНС'])),
-      'is-ca':     alreadyFilled.has('is-ca')     ? null : sc(findVal(['Итого оборотные','Оборотные активы','Current assets'])),
-      'is-cl':     alreadyFilled.has('is-cl')     ? null : sc(findVal(['Итого краткосрочные','Краткосрочные обязательства','Current liabilities'])),
+      'is-assets': alreadyFilled.has('is-assets') ? null : sc(findVal(['Итого активы','Итого активов','Совокупные активы','Всего активов','Total assets','ИТОГО АКТИВЫ','БАЛАНС'])),
+      'is-ca':     alreadyFilled.has('is-ca')     ? null : sc(findVal(['Итого оборотн\\w*\\s+активов','Итого оборотных','Оборотные активы','Total current assets','Current assets'])),
+      'is-cl':     alreadyFilled.has('is-cl')     ? null : sc(findVal(['Итого краткосрочн\\w*\\s+обязательств','Итого краткосрочных','Краткосрочные обязательства','Total current liabilities','Current liabilities'])),
       'is-debt':   alreadyFilled.has('is-debt')   ? null : sc(findVal(['Заемные средства','Кредиты и займы','Total borrowings','Долгосрочные займы'])),
-      'is-cash':   alreadyFilled.has('is-cash')   ? null : sc(findVal(['Денежные средства и эквиваленты','Cash and cash equivalents','ДС и их эквиваленты'])),
-      'is-ret':    alreadyFilled.has('is-ret')    ? null : sc(findVal(['Нераспределенная прибыль','Нераспределённая прибыль','Retained earnings'])),
-      'is-eq':     alreadyFilled.has('is-eq')     ? null : sc(findVal(['Итого капитал','Собственный капитал','Total equity','ИТОГО КАПИТАЛ'])),
+      'is-cash':   alreadyFilled.has('is-cash')   ? null : sc(findVal(['Денежные средства и (их )?эквивалент','Cash and cash equivalents','ДС и их эквивалент'])),
+      'is-ret':    alreadyFilled.has('is-ret')    ? null : sc(findVal(['Нераспредел[её]нная прибыль','Retained earnings'])),
+      'is-eq':     alreadyFilled.has('is-eq')     ? null : sc(findVal(['Итого капитал','Итого собственн\\w*\\s+капитал','Собственный капитал','Total equity','ИТОГО КАПИТАЛ'])),
     };
     const labels = {
       'is-rev':'Выручка','is-ebitda':'EBITDA','is-ebit':'EBIT','is-np':'Чистая прибыль',
@@ -4862,13 +4957,7 @@ async function repExtractPdf(file){
   pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   const buf=await file.arrayBuffer();
   const pdf=await pdfjsLib.getDocument({data:buf}).promise;
-  let t='';
-  for(let i=1;i<=Math.min(pdf.numPages,80);i++){
-    const pg=await pdf.getPage(i);
-    const ct=await pg.getTextContent();
-    t+=ct.items.map(s=>s.str).join(' ')+'\n';
-  }
-  return t;
+  return await extractPdfTextLines(pdf, 80);
 }
 
 async function repExtractDocx(file){
@@ -4892,25 +4981,24 @@ async function repExtractXlsx(file){
 }
 
 function repFillFromText(rawText){
-  // Определяем масштаб ДО замены пробелов
+  // Масштаб — только по заголовку документа (первые 3000 символов).
   let scale=1;
-  if(/тыс[\s\S]{0,20}руб/i.test(rawText)||/в тысячах/i.test(rawText)) scale=0.000001;
-  else if(/млн[\s\S]{0,10}руб/i.test(rawText)||/в миллионах/i.test(rawText)) scale=0.001;
+  const head = (rawText||'').slice(0,3000);
+  if(/в\s+тысячах\s+рубл/i.test(head) || /\(тыс\.?\s*руб/i.test(head)) scale=0.000001;
+  else if(/в\s+миллионах\s+рубл/i.test(head) || /\(млн\.?\s*руб/i.test(head) || /миллионах\s+росс/i.test(head)) scale=0.001;
+  else if(/в\s+миллиардах\s+рубл/i.test(head) || /\(млрд\.?\s*руб/i.test(head)) scale=1;
 
-  // Очищаем пробелы и скобки
-  let txt=rawText.replace(/(\d)[ \u00a0\t]{1,3}(\d)/g,'$1$2');
-  txt=txt.replace(/\((\d[\d\s]{1,20})\)/g,(m,n)=>'-'+n.replace(/\s/g,''));
+  const txt = rawText || '';
 
   function findVal(patterns){
+    const lines = txt.split('\n');
     for(const pat of patterns){
-      const re=new RegExp(pat+'[^\\n]{0,300}','gi');
-      let m;
-      while((m=re.exec(txt))!==null){
-        const line=m[0];
-        const nums=[...line.matchAll(/[-]?\d{4,}/g)]
-          .map(n=>parseFloat(n[0]))
-          .filter(n=>!isNaN(n)&&Math.abs(n)>=1000&&!(n>=2000&&n<=2999));
-        if(nums.length>0) return nums[0];
+      const re = new RegExp(pat, 'i');
+      for(const line of lines){
+        if(!re.test(line)) continue;
+        const nums = filterMeaningfulNumbers(extractNumbersFromLine(line), {minAbs: 1});
+        const v = pickPrimaryNumber(nums);
+        if(v!=null) return v;
       }
     }
     return null;
@@ -4918,18 +5006,18 @@ function repFillFromText(rawText){
   const sc=v=>v!=null?parseFloat((v*scale).toFixed(6)):null;
 
   const map={
-    'rep-np-rev':   sc(findVal(['Выручка','Доходы от реализации','Итого выручка','Revenue'])),
+    'rep-np-rev':   sc(findVal(['Выручка по договорам','Выручка от реализации','Итого выручк\\w*','^\\s*Выручка\\b','Доходы от реализации','Revenue'])),
     'rep-np-ebitda':sc(findVal(['EBITDA','Прибыль до вычета процентов','ЕБИТДА'])),
     'rep-np-ebit':  sc(findVal(['Операционная прибыль','Прибыль от продаж','EBIT'])),
-    'rep-np-np':    sc(findVal(['Чистая прибыль','Итого чистая прибыль','Прибыль за период','Net profit'])),
-    'rep-np-int':   sc(findVal(['Проценты к уплате','Процентные расходы','Расходы по процентам','Finance costs'])),
-    'rep-np-assets':sc(findVal(['Итого активы','Совокупные активы','Всего активов','Total assets','ИТОГО АКТИВЫ','БАЛАНС'])),
-    'rep-np-ca':    sc(findVal(['Итого оборотные','Оборотные активы','Current assets'])),
-    'rep-np-cl':    sc(findVal(['Итого краткосрочные','Краткосрочные обязательства','Current liabilities'])),
+    'rep-np-np':    sc(findVal(['Чистая прибыль','Итого чистая прибыль','Прибыль за период','Прибыль за отчетн','Net profit','Profit for the period'])),
+    'rep-np-int':   sc(findVal(['Проценты к уплате','Процентные расходы','Расходы по процентам','Финансовые расходы','Finance costs'])),
+    'rep-np-assets':sc(findVal(['Итого активы','Итого активов','Совокупные активы','Всего активов','Total assets','ИТОГО АКТИВЫ','БАЛАНС'])),
+    'rep-np-ca':    sc(findVal(['Итого оборотн\\w*\\s+активов','Итого оборотных','Оборотные активы','Total current assets','Current assets'])),
+    'rep-np-cl':    sc(findVal(['Итого краткосрочн\\w*\\s+обязательств','Итого краткосрочных','Краткосрочные обязательства','Total current liabilities','Current liabilities'])),
     'rep-np-debt':  sc(findVal(['Заемные средства','Кредиты и займы','Total borrowings'])),
-    'rep-np-cash':  sc(findVal(['Денежные средства и эквиваленты','Cash and cash equivalents'])),
-    'rep-np-ret':   sc(findVal(['Нераспределенная прибыль','Нераспределённая прибыль','Retained earnings'])),
-    'rep-np-eq':    sc(findVal(['Итого капитал','Собственный капитал','Total equity','ИТОГО КАПИТАЛ'])),
+    'rep-np-cash':  sc(findVal(['Денежные средства и (их )?эквивалент','Cash and cash equivalents','ДС и их эквивалент'])),
+    'rep-np-ret':   sc(findVal(['Нераспредел[её]нная прибыль','Retained earnings'])),
+    'rep-np-eq':    sc(findVal(['Итого капитал','Итого собственн\\w*\\s+капитал','Собственный капитал','Total equity','ИТОГО КАПИТАЛ'])),
   };
   const log=document.getElementById('rep-np-parse-log');
   const lines=[];
@@ -4965,22 +5053,23 @@ const RSBU_CODES = {
 
 function extractByRsbuCodes(txt) {
   const result = {};
+  const lines = (txt||'').split('\n');
   for (const [fieldId, codes] of Object.entries(RSBU_CODES)) {
     if (!codes.length) continue;
     for (const code of codes) {
-      const re = new RegExp('(?:^|,|\\t| )' + code + '(?:,|\\t| |$)[^\\n]{0,200}', 'gm');
-      let m;
-      while ((m = re.exec(txt)) !== null) {
-        const line = m[0];
-        const nums = [...line.matchAll(/[-]?\d{4,}/g)]
-          .map(n => parseFloat(n[0]))
-          // Исключаем сам код и числа похожие на другие коды РСБУ (1000-1999, 2000-2999)
-          // НО только если они точно равны коду, а не просто содержат его цифры
-          .filter(n => !isNaN(n) && Math.abs(n) >= 1000 && Math.abs(n) !== parseInt(code));
-        if (nums.length > 0) {
-          const val = nums[0];
+      const codeRe = new RegExp('(?:^|[\\s,\\t])' + code + '(?:[\\s,\\t]|$)');
+      for (const line of lines) {
+        if(!codeRe.test(line)) continue;
+        // Используем корректный извлекатель чисел с разделителем тысяч.
+        // После кода строки идёт пояснение, потом значение(я) — берём первое
+        // число, которое не равно самому коду.
+        const codeNum = parseInt(code);
+        const nums = extractNumbersFromLine(line)
+          .filter(n => Math.abs(n) >= 1 && Math.abs(n) !== codeNum);
+        const val = pickPrimaryNumber(nums);
+        if (val != null) {
           if (fieldId === 'is-debt' && fieldId in result) {
-            result[fieldId] = (result[fieldId] || 0) + val; // суммируем долг
+            result[fieldId] = (result[fieldId] || 0) + val;
           } else if (!(fieldId in result)) {
             result[fieldId] = val;
           }
