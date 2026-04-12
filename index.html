@@ -4322,7 +4322,7 @@ function repRenderPeriod(){
   document.getElementById('rep-period-meta').textContent = `${iss.name} · ${p.year} ${p.period} ${p.type}${p.note?' · '+p.note:''}`;
   if(repViewMode==='cards') repRenderCards(p);
   else if(repViewMode==='text') repRenderText(p, iss);
-  else if(repViewMode==='analysis') repRenderAnalysis(p);
+  else if(repViewMode==='analysis') repRenderAnalysis(p, iss);
   else repRenderCharts(iss);
 }
 
@@ -4449,13 +4449,37 @@ function repRenderCharts(iss){
   document.getElementById('rep-chart-area').innerHTML = `<div style="overflow-x:auto;white-space:nowrap">${charts}</div>`;
 }
 
-function repRenderAnalysis(p){
+function repRenderAnalysis(p, iss){
   const area = document.getElementById('rep-analysis-area');
+  // 1) Если у периода сохранён снэпшот анализа — показываем его (старое поведение).
   if(p.analysisHTML){
     area.innerHTML = p.analysisHTML;
-  } else {
-    area.innerHTML = `<div class="empty"><div class="ei">📊</div><p>Анализ со шкалами не сохранён для этого периода.<br><span style="font-size:.65rem">Перейдите в «🏢 Эмитент», заполните данные и нажмите<br>«💾 Сохранить в базу отчётности»</span></p></div>`;
+    return;
   }
+  // 2) Иначе строим шкалы на лету из числовых полей периода.
+  const d = {
+    co:     iss?.name || 'Эмитент',
+    ind:    iss?.ind || 'other',
+    bond:   '', rating: '',
+    repType:p.type   || '',
+    period: [p.year,p.period].filter(Boolean).join(' '),
+    rev:    p.rev,
+    ebitda: p.ebitda,
+    ebit:   p.ebit,
+    np:     p.np,
+    intExp: p.int,
+    tax:    p.tax,
+    dep:    null,
+    assets: p.assets,
+    ca:     p.ca,
+    cl:     p.cl,
+    debt:   p.debt,
+    cash:   p.cash,
+    eq:     p.eq,
+    sz:     null,
+    peak:   null,
+  };
+  area.innerHTML = buildAnalysisHTML(d, {mode:'archive'});
 }
 
 // ── Compare ──
@@ -4827,32 +4851,32 @@ function metricBlock(termEn, termRu, formula, val, displayVal, unit, color, gaug
   </div>`;
 }
 
-function analyzeAuto() {
-  const co    = document.getElementById('is-co')?.value?.trim()||'Эмитент';
-  const ind   = document.getElementById('is-ind')?.value||'other';
-  const bond  = document.getElementById('is-bond')?.value?.trim()||'';
-  const rating= document.getElementById('is-rating')?.value?.trim()||'';
-
-  const rev    = gv('is-rev');
-  const ebitdaInput = gv('is-ebitda');
-  const ebit   = gv('is-ebit');
-  const np     = gv('is-np');
-  const intExp = gv('is-int');
-  const tax    = gv('is-tax');
-  const dep    = gv('is-dep');
-  const assets = gv('is-assets');
-  const ca     = gv('is-ca');
-  const cl     = gv('is-cl');
-  const debt   = gv('is-debt');
-  const cash   = gv('is-cash');
-  const eq     = gv('is-eq');
-  const sz     = gv('is-sz');
-  const peak   = gv('is-peak');
-
-  const repType = document.getElementById('is-rep-type')?.value||'';
-  const perSel  = document.getElementById('is-rep-period')?.value||'';
-  const perCustom = document.getElementById('is-rep-period-custom')?.value?.trim()||'';
-  const period  = perSel==='custom' ? perCustom : perSel;
+// Ядро анализа: принимает данные объектом, возвращает HTML-строку со шкалами.
+// opts.mode: 'editor' (по умолчанию) — добавляет сводку и кнопки «Сохранить»/«Экспорт».
+//            'archive' — только шкалы (используется в «📂 База отчётности»).
+function buildAnalysisHTML(d, opts={}) {
+  const mode = opts.mode || 'editor';
+  const co    = d.co||'Эмитент';
+  const ind   = d.ind||'other';
+  const bond  = d.bond||'';
+  const rating= d.rating||'';
+  const rev    = d.rev ?? null;
+  const ebitdaInput = d.ebitda ?? null;
+  const ebit   = d.ebit ?? null;
+  const np     = d.np ?? null;
+  const intExp = d.intExp ?? null;
+  const tax    = d.tax ?? null;
+  const dep    = d.dep ?? null;
+  const assets = d.assets ?? null;
+  const ca     = d.ca ?? null;
+  const cl     = d.cl ?? null;
+  const debt   = d.debt ?? null;
+  const cash   = d.cash ?? null;
+  const eq     = d.eq ?? null;
+  const sz     = d.sz ?? null;
+  const peak   = d.peak ?? null;
+  const repType = d.repType||'';
+  const period  = d.period||'';
 
   const norms = IND_NORMS[ind]||IND_NORMS.other;
 
@@ -5051,12 +5075,36 @@ function analyzeAuto() {
 
   const hasAny = debtSection||profSection||liqSection||bondSection;
 
-  document.getElementById('iss-res-content').innerHTML = !hasAny ? `
-    <div class="empty"><div class="ei">📊</div><p>Заполните показатели на вкладке «Данные эмитента»<br>или загрузите файл отчётности — нажмите «Рассчитать»</p></div>
-  ` : `
+  if(!hasAny) {
+    return `<div class="empty"><div class="ei">📊</div><p>${mode==='archive'
+      ? 'Для этого периода нет числовых данных для построения шкал.'
+      : 'Заполните показатели на вкладке «Данные эмитента»<br>или загрузите файл отчётности — нажмите «Рассчитать»'}</p></div>`;
+  }
+
+  const periodLabel = (period||repType) ? `${[repType,period].filter(Boolean).join(' · ')}` : '';
+
+  const footerExtras = mode==='editor' ? `
+    <!-- Краткая сводка для копирования -->
+    <div class="card" style="margin-top:4px;border-color:rgba(0,212,255,.2)">
+      <div class="card-hdr" style="color:var(--acc)">📋 Сводка для копирования
+        <button class="btn btn-sm" style="margin-left:auto" onclick="copyAnalysisSummary()">📄 Скопировать</button>
+      </div>
+      <div class="card-body">
+        <pre id="analysis-summary-text" style="font-size:.64rem;color:var(--text2);white-space:pre-wrap;line-height:1.7;font-family:var(--mono)">${buildSummaryText({co,bond,ind,rating,repType,period,rev,ebitda,ebitdaHow,ebit,np,intExp,tax,dep,assets,ca,cl,debt,cash,eq,sz,nd,ndE,icr,cur,deRatio,eqRatio,npm,ebitdam,roe,roa,szEbitda,szNd,peakCov,riskLevel})}</pre>
+      </div>
+    </div>
+
+    <!-- Кнопки действий -->
+    <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+      <button class="btn btn-p btn-sm" onclick="saveAnalysisToBase()">💾 Сохранить в базу отчётности</button>
+      <button class="btn btn-sm" onclick="exportAllData()">⬇️ Экспорт всех данных (JSON)</button>
+    </div>
+  ` : '';
+
+  return `
     <div style="display:flex;align-items:center;gap:14px;padding:12px 16px;background:var(--s1);border:1px solid var(--border);margin-bottom:14px;flex-wrap:wrap">
       <div>
-        <div style="font-size:.57rem;letter-spacing:.1em;text-transform:uppercase;color:var(--text3)">Эмитент</div>
+        <div style="font-size:.57rem;letter-spacing:.1em;text-transform:uppercase;color:var(--text3)">Эмитент${periodLabel?' · '+periodLabel:''}</div>
         <div style="font-size:.95rem;font-weight:600;color:var(--text)">${co}${bond?' · '+bond:''}</div>
         <div style="font-size:.63rem;color:var(--text2)">${IND_NAMES[ind]}${rating?' · '+rating:''}</div>
       </div>
@@ -5087,25 +5135,40 @@ function analyzeAuto() {
     </div>`:''}
 
     <div style="font-size:.58rem;color:var(--text3);padding:8px 2px;line-height:1.6">
-      Расчёт автономный · без AI · по введённым данным · ${new Date().toLocaleDateString('ru-RU')}
+      Расчёт автономный · без AI · ${mode==='archive'?'по данным периода':'по введённым данным'} · ${new Date().toLocaleDateString('ru-RU')}
     </div>
-
-    <!-- Краткая сводка для копирования -->
-    <div class="card" style="margin-top:4px;border-color:rgba(0,212,255,.2)">
-      <div class="card-hdr" style="color:var(--acc)">📋 Сводка для копирования
-        <button class="btn btn-sm" style="margin-left:auto" onclick="copyAnalysisSummary()">📄 Скопировать</button>
-      </div>
-      <div class="card-body">
-        <pre id="analysis-summary-text" style="font-size:.64rem;color:var(--text2);white-space:pre-wrap;line-height:1.7;font-family:var(--mono)">${buildSummaryText({co,bond,ind,rating,repType,period,rev,ebitda,ebitdaHow,ebit,np,intExp,tax,dep,assets,ca,cl,debt,cash,eq,sz,nd,ndE,icr,cur,deRatio,eqRatio,npm,ebitdam,roe,roa,szEbitda,szNd,peakCov,riskLevel})}</pre>
-      </div>
-    </div>
-
-    <!-- Кнопки действий -->
-    <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
-      <button class="btn btn-p btn-sm" onclick="saveAnalysisToBase()">💾 Сохранить в базу отчётности</button>
-      <button class="btn btn-sm" onclick="exportAllData()">⬇️ Экспорт всех данных (JSON)</button>
-    </div>
+    ${footerExtras}
   `;
+}
+
+// Публичная обёртка: собирает данные из форм «🏢 Эмитент» и рендерит шкалы.
+function analyzeAuto() {
+  const perSel   = document.getElementById('is-rep-period')?.value||'';
+  const perCustom= document.getElementById('is-rep-period-custom')?.value?.trim()||'';
+  const d = {
+    co:     document.getElementById('is-co')?.value?.trim()||'Эмитент',
+    ind:    document.getElementById('is-ind')?.value||'other',
+    bond:   document.getElementById('is-bond')?.value?.trim()||'',
+    rating: document.getElementById('is-rating')?.value?.trim()||'',
+    rev:    gv('is-rev'),
+    ebitda: gv('is-ebitda'),
+    ebit:   gv('is-ebit'),
+    np:     gv('is-np'),
+    intExp: gv('is-int'),
+    tax:    gv('is-tax'),
+    dep:    gv('is-dep'),
+    assets: gv('is-assets'),
+    ca:     gv('is-ca'),
+    cl:     gv('is-cl'),
+    debt:   gv('is-debt'),
+    cash:   gv('is-cash'),
+    eq:     gv('is-eq'),
+    sz:     gv('is-sz'),
+    peak:   gv('is-peak'),
+    repType: document.getElementById('is-rep-type')?.value||'',
+    period:  perSel==='custom' ? perCustom : perSel,
+  };
+  document.getElementById('iss-res-content').innerHTML = buildAnalysisHTML(d, {mode:'editor'});
 }
 
 function analyzeAutoClick() {
