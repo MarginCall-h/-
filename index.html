@@ -1700,10 +1700,11 @@ async function refreshAllPrices() {
 // ══════════════════════════════════════════════════════
 
 // Достаёт текст PDF с сохранением строк и колонок таблиц. pdf.js даёт
-// TextContent-item'ы с координатами transform=[a,b,c,d,x,y] и width.
-// Группируем по Y (строки) и ставим несколько пробелов между item'ами,
-// если между ними большой горизонтальный разрыв — иначе соседние
-// колонки таблицы склеиваются в одно длинное «число».
+// TextContent-item'ы в storage-order (не обязательно в порядке чтения),
+// поэтому мы сначала группируем их по Y (строки), потом внутри каждой
+// строки сортируем по X. Между соседними item'ами на одной строке
+// ставим один пробел (разделитель тысяч / слов) или несколько — если
+// между ними большой горизонтальный разрыв (значит это колонка таблицы).
 async function extractPdfTextLines(pdf, maxPages=80) {
   let out = '';
   const pages = Math.min(pdf.numPages, maxPages);
@@ -1712,42 +1713,57 @@ async function extractPdfTextLines(pdf, maxPages=80) {
     try { page = await pdf.getPage(i); } catch(e){ continue; }
     let content;
     try { content = await page.getTextContent(); } catch(e){ continue; }
-    const items = content.items || [];
-    let prevY = null, prevXEnd = null, prevH = 12;
-    let line = '';
+    const items = (content.items || []).filter(it => (it.str||'').length);
+    if(!items.length) { out += '\n'; continue; }
+
+    // Средняя высота шрифта — для расчёта порогов Y-группировки и X-gap.
+    const heights = items.map(it => it.height || Math.abs((it.transform||[])[3]) || 12);
+    const avgH = heights.reduce((a,b)=>a+b,0) / heights.length || 12;
+    const yTol = Math.max(1.5, avgH * 0.4); // tolerance для «одной строки»
+
+    // Группируем items по Y (с толерантностью yTol). Ключ — округлённый Y.
+    const byLine = new Map();
     for(const it of items) {
       const tr = it.transform || [];
-      const x = tr[4], y = tr[5];
-      const h = it.height || Math.abs(tr[3]) || 12;
-      const w = it.width || 0;
-      const s = (it.str || '');
-      // Новая строка: скачок по Y больше половины высоты шрифта.
-      if(prevY !== null && y !== null && Math.abs(y - prevY) > Math.max(2, h*0.5)) {
-        if(line.trim()) out += line.trim() + '\n';
-        line = '';
-        prevXEnd = null;
+      const y = tr[5];
+      if(y == null) continue;
+      // Ищем уже существующую линию с близким Y
+      let bucketKey = null;
+      for(const k of byLine.keys()) {
+        if(Math.abs(k - y) <= yTol) { bucketKey = k; break; }
       }
-      if(prevXEnd !== null && x !== null) {
-        const gap = x - prevXEnd;
-        // Порог: разрыв больше 40% высоты шрифта ≈ несколько space-width.
-        // Типичная пробельная ширина — 0.25-0.35 высоты. 40% = 1 или более
-        // пробелов, что означает колонку таблицы или табуляцию.
-        if(gap > h * 0.4) {
-          // Большой gap — вставляем ТРИ пробела (этого достаточно чтобы
-          // extractNumbersFromLine не счёл соседнее число разделителем
-          // тысяч, который требует ровно одного пробела).
-          if(line && !line.endsWith(' ')) line += '   ';
-          else line += '  ';
-        } else if(line && !line.endsWith(' ')) {
-          line += ' '; // обычная граница слов/внутри числа («22 242»)
-        }
-      }
-      line += s;
-      if(y !== null) prevY = y;
-      if(x !== null) prevXEnd = x + w;
-      prevH = h;
+      if(bucketKey == null) bucketKey = y;
+      if(!byLine.has(bucketKey)) byLine.set(bucketKey, []);
+      byLine.get(bucketKey).push(it);
     }
-    if(line.trim()) out += line.trim() + '\n';
+
+    // Сортируем строки сверху вниз: в PDF координата Y растёт вверх.
+    const lines = [...byLine.entries()].sort((a,b) => b[0] - a[0]);
+
+    for(const [, lineItems] of lines) {
+      // Внутри строки — слева направо.
+      lineItems.sort((a,b) => (a.transform?.[4]||0) - (b.transform?.[4]||0));
+      let line = '';
+      let prevXEnd = null;
+      for(const it of lineItems) {
+        const tr = it.transform || [];
+        const x = tr[4];
+        const w = it.width || 0;
+        const s = (it.str || '');
+        if(prevXEnd !== null && x !== null) {
+          const gap = x - prevXEnd;
+          if(gap > avgH * 0.4) {
+            // Колонка таблицы / явный разрыв — несколько пробелов.
+            line += '   ';
+          } else if(line && !line.endsWith(' ')) {
+            line += ' ';
+          }
+        }
+        line += s;
+        if(x !== null) prevXEnd = x + w;
+      }
+      if(line.trim()) out += line.trim() + '\n';
+    }
     out += '\n';
   }
   return out;
@@ -1850,17 +1866,24 @@ async function parseAnyReport(input) {
     }
 
     // ── Общий парсинг ──
-    // Масштаб определяем СТРОГО по заголовку — первые 3000 символов,
-    // чтобы случайное упоминание «тыс.» в примечании не сломало шкалу.
+    // Масштаб ищем по всему документу — в длинных МСФО-отчётах шапка
+    // таблицы «(в миллионах рублей)» может быть только на 3-5 странице,
+    // после титульного листа и оглавления. Берём ПЕРВОЕ явное указание,
+    // чтобы не подхватить стороннее «тыс.» из примечаний.
+    const SCALE_RES = [
+      {re: /в\s+миллиардах\s+рубл/i,                         s: 1},
+      {re: /\(\s*млрд\.?\s*руб/i,                            s: 1},
+      {re: /в\s+миллионах\s+рубл/i,                          s: 0.001},
+      {re: /\(\s*млн\.?\s*руб/i,                             s: 0.001},
+      {re: /миллионах\s+росс/i,                              s: 0.001},
+      {re: /в\s+тысячах\s+рубл/i,                            s: 0.000001},
+      {re: /\(\s*тыс\.?\s*руб/i,                             s: 0.000001},
+    ];
     let scale = 1;
-    const head = txt.slice(0, 3000);
-    if (/в\s+тысячах\s+рубл/i.test(head) || /\(тыс\.?\s*руб/i.test(head)) {
-      scale = 0.000001; // тыс.руб → млрд
-    } else if (/в\s+миллионах\s+рубл/i.test(head) || /\(млн\.?\s*руб/i.test(head) ||
-               /миллионах\s+росс/i.test(head)) {
-      scale = 0.001;    // млн.руб → млрд
-    } else if (/в\s+миллиардах\s+рубл/i.test(head) || /\(млрд\.?\s*руб/i.test(head)) {
-      scale = 1;
+    let earliest = Infinity;
+    for(const {re, s} of SCALE_RES) {
+      const m = re.exec(txt);
+      if(m && m.index < earliest) { earliest = m.index; scale = s; }
     }
 
     // Ищем число на строке с ключом. НЕ трогаем исходный текст глобально —
@@ -4981,16 +5004,27 @@ async function repExtractXlsx(file){
 }
 
 function repFillFromText(rawText){
-  // Масштаб — только по заголовку документа (первые 3000 символов).
-  let scale=1;
-  const head = (rawText||'').slice(0,3000);
-  if(/в\s+тысячах\s+рубл/i.test(head) || /\(тыс\.?\s*руб/i.test(head)) scale=0.000001;
-  else if(/в\s+миллионах\s+рубл/i.test(head) || /\(млн\.?\s*руб/i.test(head) || /миллионах\s+росс/i.test(head)) scale=0.001;
-  else if(/в\s+миллиардах\s+рубл/i.test(head) || /\(млрд\.?\s*руб/i.test(head)) scale=1;
-
   const txt = rawText || '';
+  // Масштаб — первое явное указание в документе (не ограничиваемся шапкой,
+  // потому что в длинных МСФО-отчётах «(в миллионах рублей)» бывает на
+  // 3-5 странице, после титула и оглавления).
+  const SCALE_RES = [
+    {re: /в\s+миллиардах\s+рубл/i,    s: 1},
+    {re: /\(\s*млрд\.?\s*руб/i,       s: 1},
+    {re: /в\s+миллионах\s+рубл/i,     s: 0.001},
+    {re: /\(\s*млн\.?\s*руб/i,        s: 0.001},
+    {re: /миллионах\s+росс/i,         s: 0.001},
+    {re: /в\s+тысячах\s+рубл/i,       s: 0.000001},
+    {re: /\(\s*тыс\.?\s*руб/i,        s: 0.000001},
+  ];
+  let scale=1, earliest=Infinity;
+  for(const {re, s} of SCALE_RES){
+    const m = re.exec(txt);
+    if(m && m.index < earliest){ earliest = m.index; scale = s; }
+  }
 
-  function findVal(patterns){
+  const sources = {}; // id → {line, value, pattern} — для отладочного лога
+  function findValTrace(patterns, traceId){
     const lines = txt.split('\n');
     for(const pat of patterns){
       const re = new RegExp(pat, 'i');
@@ -4998,38 +5032,68 @@ function repFillFromText(rawText){
         if(!re.test(line)) continue;
         const nums = filterMeaningfulNumbers(extractNumbersFromLine(line), {minAbs: 1});
         const v = pickPrimaryNumber(nums);
-        if(v!=null) return v;
+        if(v!=null) {
+          if(traceId) sources[traceId] = {line: line.trim(), value: v, pattern: pat};
+          return v;
+        }
       }
     }
     return null;
   }
+  const findVal = (pats) => findValTrace(pats);
   const sc=v=>v!=null?parseFloat((v*scale).toFixed(6)):null;
 
   const map={
-    'rep-np-rev':   sc(findVal(['Выручка по договорам','Выручка от реализации','Итого выручк\\w*','^\\s*Выручка\\b','Доходы от реализации','Revenue'])),
-    'rep-np-ebitda':sc(findVal(['EBITDA','Прибыль до вычета процентов','ЕБИТДА'])),
-    'rep-np-ebit':  sc(findVal(['Операционная прибыль','Прибыль от продаж','EBIT'])),
-    'rep-np-np':    sc(findVal(['Чистая прибыль','Итого чистая прибыль','Прибыль за период','Прибыль за отчетн','Net profit','Profit for the period'])),
-    'rep-np-int':   sc(findVal(['Проценты к уплате','Процентные расходы','Расходы по процентам','Финансовые расходы','Finance costs'])),
-    'rep-np-assets':sc(findVal(['Итого активы','Итого активов','Совокупные активы','Всего активов','Total assets','ИТОГО АКТИВЫ','БАЛАНС'])),
-    'rep-np-ca':    sc(findVal(['Итого оборотн\\w*\\s+активов','Итого оборотных','Оборотные активы','Total current assets','Current assets'])),
-    'rep-np-cl':    sc(findVal(['Итого краткосрочн\\w*\\s+обязательств','Итого краткосрочных','Краткосрочные обязательства','Total current liabilities','Current liabilities'])),
-    'rep-np-debt':  sc(findVal(['Заемные средства','Кредиты и займы','Total borrowings'])),
-    'rep-np-cash':  sc(findVal(['Денежные средства и (их )?эквивалент','Cash and cash equivalents','ДС и их эквивалент'])),
-    'rep-np-ret':   sc(findVal(['Нераспредел[её]нная прибыль','Retained earnings'])),
-    'rep-np-eq':    sc(findVal(['Итого капитал','Итого собственн\\w*\\s+капитал','Собственный капитал','Total equity','ИТОГО КАПИТАЛ'])),
+    'rep-np-rev':   sc(findValTrace(['Выручка по договорам','Выручка от реализации','Итого выручк\\w*','^\\s*Выручка\\b','Доходы от реализации','Revenue'], 'rep-np-rev')),
+    'rep-np-ebitda':sc(findValTrace(['EBITDA','Прибыль до вычета процентов','ЕБИТДА'], 'rep-np-ebitda')),
+    'rep-np-ebit':  sc(findValTrace(['Операционная прибыль','Прибыль от продаж','EBIT'], 'rep-np-ebit')),
+    'rep-np-np':    sc(findValTrace(['Чистая прибыль','Итого чистая прибыль','Прибыль за период','Прибыль за отчетн','Net profit','Profit for the period'], 'rep-np-np')),
+    'rep-np-int':   sc(findValTrace(['Проценты к уплате','Процентные расходы','Расходы по процентам','Финансовые расходы','Finance costs'], 'rep-np-int')),
+    'rep-np-assets':sc(findValTrace(['Итого активы','Итого активов','Совокупные активы','Всего активов','Total assets','ИТОГО АКТИВЫ','БАЛАНС'], 'rep-np-assets')),
+    'rep-np-ca':    sc(findValTrace(['Итого оборотн\\w*\\s+активов','Итого оборотных','Оборотные активы','Total current assets','Current assets'], 'rep-np-ca')),
+    'rep-np-cl':    sc(findValTrace(['Итого краткосрочн\\w*\\s+обязательств','Итого краткосрочных','Краткосрочные обязательства','Total current liabilities','Current liabilities'], 'rep-np-cl')),
+    'rep-np-debt':  sc(findValTrace(['Заемные средства','Кредиты и займы','Total borrowings'], 'rep-np-debt')),
+    'rep-np-cash':  sc(findValTrace(['Денежные средства и (их )?эквивалент','Cash and cash equivalents','ДС и их эквивалент'], 'rep-np-cash')),
+    'rep-np-ret':   sc(findValTrace(['Нераспредел[её]нная прибыль','Retained earnings'], 'rep-np-ret')),
+    'rep-np-eq':    sc(findValTrace(['Итого капитал','Итого собственн\\w*\\s+капитал','Собственный капитал','Total equity','ИТОГО КАПИТАЛ'], 'rep-np-eq')),
   };
   const log=document.getElementById('rep-np-parse-log');
-  const lines=[];
+  const labels = {
+    'rep-np-rev':'Выручка','rep-np-ebitda':'EBITDA','rep-np-ebit':'EBIT',
+    'rep-np-np':'ЧП','rep-np-int':'Проценты','rep-np-assets':'Активы',
+    'rep-np-ca':'Обор. активы','rep-np-cl':'Кр. обяз.','rep-np-debt':'Долг',
+    'rep-np-cash':'ДС','rep-np-ret':'Нераспр.','rep-np-eq':'Капитал'
+  };
+  const logLines=[];
   let filled=0;
   for(const[id,val] of Object.entries(map)){
     if(val!=null){
       document.getElementById(id).value=val;
-      lines.push(`<span style="color:var(--green)">✓</span> ${val}`);
+      const src = sources[id];
+      // Источник для отладки: какая строка PDF, какое сырое число, какое после scale.
+      const lineShort = src?.line?.slice(0,90) + (src?.line?.length>90 ? '…' : '') || '';
+      logLines.push(
+        `<div style="padding:3px 0;border-bottom:1px dotted rgba(30,48,72,.4)">`+
+        `<span style="color:var(--green)">✓</span> <strong>${labels[id]||id}</strong> = `+
+        `<span style="color:var(--acc)">${val}</span> <span style="color:var(--text3)">(сырое ${src?.value??'?'} × scale ${scale})</span>`+
+        (lineShort ? `<br><span style="color:var(--text3);font-size:.56rem">↳ ${lineShort.replace(/</g,'&lt;')}</span>` : '')+
+        `</div>`
+      );
       filled++;
     }
   }
-  if(lines.length){log.style.display='block';log.innerHTML=lines.join(' · ');}
+  const notFound = Object.keys(map).filter(k => map[k]==null);
+  if(notFound.length) {
+    logLines.push(
+      `<div style="padding:4px 0;margin-top:4px;color:var(--warn);font-size:.58rem">`+
+      `⚠ Не найдено: ${notFound.map(k=>labels[k]||k).join(', ')}`+
+      `</div>`
+    );
+  }
+  if(logLines.length){
+    log.style.display='block';
+    log.innerHTML = `<div style="color:var(--text3);font-size:.55rem;margin-bottom:4px">Масштаб: ${scale===1?'млрд ₽':scale===0.001?'млн ₽ → млрд':'тыс. ₽ → млрд'}</div>` + logLines.join('');
+  }
   return filled;
 }
 
