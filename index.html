@@ -202,11 +202,39 @@ tr:hover td{background:var(--s2)}
 
 @media(max-width:800px){.sidebar{display:none}.g3,.g4{grid-template-columns:1fr 1fr}}
 </style>
+<!-- Библиотеки работы с файлами. Грузим статически; а на случай если внешний
+     скрипт ещё не готов в момент клика (htmlpreview.github.io рендерит
+     HTML через innerHTML и внешние скрипты загружаются асинхронно) —
+     ниже ленивые loader-ы, которые подтянут библиотеку по требованию. -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js"></script>
-<!-- OCR для PDF-сканов без текстового слоя. Грузим только по требованию -->
 <script>
+function _loadScript(src){
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload  = () => resolve();
+    s.onerror = () => reject(new Error('Не удалось загрузить '+src));
+    document.head.appendChild(s);
+  });
+}
+// Ленивые лоадеры: дают функции, которые гарантируют наличие глобала.
+window._ensurePdfjs = async () => {
+  if(typeof pdfjsLib !== 'undefined') return;
+  await _loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js');
+  if(typeof pdfjsLib === 'undefined') throw new Error('pdf.js: библиотека не стала доступна после загрузки');
+};
+window._ensureXlsx = async () => {
+  if(typeof XLSX !== 'undefined') return;
+  await _loadScript('https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js');
+  if(typeof XLSX === 'undefined') throw new Error('xlsx.js: библиотека не стала доступна');
+};
+window._ensureMammoth = async () => {
+  if(typeof mammoth !== 'undefined') return;
+  await _loadScript('https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js');
+  if(typeof mammoth === 'undefined') throw new Error('mammoth.js: библиотека не стала доступна');
+};
 window._loadTesseract = () => new Promise((resolve, reject) => {
   if(typeof Tesseract !== 'undefined') return resolve();
   const s = document.createElement('script');
@@ -1680,6 +1708,7 @@ async function parseAnyReport(input) {
 
     if (ext === 'pdf') {
       // ── PDF ──
+      await _ensurePdfjs();
       pdfjsLib.GlobalWorkerOptions.workerSrc =
         'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
       // Читаем буфер один раз и передаём копию в pdf.js
@@ -1700,22 +1729,14 @@ async function parseAnyReport(input) {
 
     } else if (ext === 'docx' || ext === 'doc') {
       // ── DOCX ──
-      if (typeof mammoth === 'undefined') {
-        status.style.color = 'var(--danger)';
-        status.textContent = '⚠️ Библиотека для DOCX не загрузилась — обновите страницу и попробуйте снова.';
-        return;
-      }
+      await _ensureMammoth();
       const buf = await file.arrayBuffer();
       const res = await mammoth.extractRawText({ arrayBuffer: buf });
       txt = res.value || '';
 
     } else if (ext === 'xlsx' || ext === 'xls') {
       // ── XLSX ──
-      if (typeof XLSX === 'undefined') {
-        status.style.color = 'var(--danger)';
-        status.textContent = '⚠️ Библиотека для XLSX не загрузилась — обновите страницу и попробуйте снова.';
-        return;
-      }
+      await _ensureXlsx();
       const buf = await file.arrayBuffer();
       const wb = XLSX.read(buf, { type: 'array' });
       wb.SheetNames.forEach(name => {
@@ -4801,6 +4822,7 @@ async function repOcrPdf(file, onProgress) {
   await window._loadTesseract();
   if(typeof Tesseract === 'undefined') throw new Error('Tesseract.js недоступен');
 
+  await _ensurePdfjs();
   pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   const buf = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({data: buf}).promise;
@@ -4836,6 +4858,7 @@ async function repOcrPdf(file, onProgress) {
 }
 
 async function repExtractPdf(file){
+  await _ensurePdfjs();
   pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   const buf=await file.arrayBuffer();
   const pdf=await pdfjsLib.getDocument({data:buf}).promise;
@@ -4849,14 +4872,14 @@ async function repExtractPdf(file){
 }
 
 async function repExtractDocx(file){
-  if(typeof mammoth === 'undefined') throw new Error('Библиотека mammoth.js не загрузилась. Проверьте интернет-соединение и перезагрузите страницу.');
+  await _ensureMammoth();
   const buf=await file.arrayBuffer();
   const res=await mammoth.extractRawText({arrayBuffer:buf});
   return res.value||'';
 }
 
 async function repExtractXlsx(file){
-  if(typeof XLSX === 'undefined') throw new Error('Библиотека XLSX не загрузилась. Проверьте интернет-соединение и перезагрузите страницу.');
+  await _ensureXlsx();
   const buf=await file.arrayBuffer();
   const wb=XLSX.read(buf,{type:'array'});
   let text='';
