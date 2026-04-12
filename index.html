@@ -1715,19 +1715,32 @@ async function refreshAllPrices() {
 // repExtractPdf/repFillFromText (вкладка «Отчётность»).
 // ══════════════════════════════════════════════════════
 
-// Извлекает текст PDF как таблицу. Каждая выходная строка имеет формат
-//   description \t value1 \t value2 \t ...
-// (TAB-разделённые ячейки). Алгоритм:
-//   1) items группируются в строки по Y.
-//   2) Внутри страницы определяется X первой «числовой» колонки — самая
-//      левая X среди items, которые являются чистыми числами (≥3 цифр).
-//      Используем 15-й перцентиль чтобы отсечь одиночные мелкие номера.
-//   3) В каждой строке: items с X < numColStart объединяются в ОДНО
-//      описание (через пробел) — русский текст не рвётся на отдельные
-//      ячейки. Items с X ≥ numColStart группируются в ячейки по
-//      X-gap > 1.5 × avgH (границы числовых колонок).
-//   4) Формат позволяет findVal искать ключ в cells[0] = desc и брать
-//      первое значащее число из cells[1..] = values.
+// Известные коды строк РСБУ (форма 1 — баланс, форма 2 — ОФР). Нужен
+// ДО extractPdfTextLines (там же идёт классификация колонок).
+const RSBU_CODE_SET = new Set([
+  1110,1120,1130,1140,1150,1160,1170,1180,1190,1100,
+  1210,1220,1230,1240,1250,1260,1200,1600,
+  1310,1320,1340,1350,1360,1370,1300,
+  1410,1420,1430,1450,1400,
+  1510,1520,1530,1540,1550,1500,
+  1700,
+  2110,2120,2100,2210,2220,2200,2310,2320,2330,2340,2350,2300,
+  2410,2421,2460,2400,2510,2520,2500,
+]);
+
+// Извлекает текст PDF как таблицу с классификацией колонок.
+// Алгоритм:
+//   1) items группируются по Y → строки.
+//   2) По всей странице строятся X-кластеры (колонки). Для каждой
+//      колонки классифицируется тип:
+//        'desc'  — в колонке много текста (не числа).
+//        'note'  — 1-2-значные целые (номера примечаний).
+//        'code'  — известные РСБУ-коды (1110-1700, 2110-2500).
+//        'value' — остальные числа ≥ 3 цифр или дробные.
+//   3) При сборке строки: все items из 'desc'-колонок склеиваются в
+//      одну текстовую ячейку (первый cell), а items из 'value'-колонок
+//      формируют последующие ячейки. Колонки 'note' и 'code' полностью
+//      игнорируются — из них никогда не придёт значение.
 async function extractPdfTextLines(pdf, maxPages=80) {
   let out = '';
   const pages = Math.min(pdf.numPages, maxPages);
@@ -1757,82 +1770,82 @@ async function extractPdfTextLines(pdf, maxPages=80) {
     }
     const linesOrdered = [...byLine.entries()].sort((a,b) => b[0] - a[0]);
 
-    // 2. X первой числовой колонки — через кластеризацию.
-    // Собираем X-начала items, являющихся «крупными» числами (≥3 знаков).
-    // Кластеризуем их: разрыв ≥ 2 × avgH → новый кластер. Первый кластер
-    // с ≥ 3 элементами — это и есть колонка значений. Используем её
-    // левую границу (min). Одиночные выбросы (номер страницы «5 из 33»,
-    // вынесенные подписи) попадают в кластеры по 1-2 элемента и игнорятся.
-    const NUM_STRICT = /^\s*\(?-?[\d][\d \u00a0]{2,}(?:[.,]\d+)?\)?\s*$/;
-    const numericXs = items.filter(it => NUM_STRICT.test(it.str)).map(it => it.transform[4]);
-    let numColStart = null;
-    if(numericXs.length >= 3) {
-      const xs = [...numericXs].sort((a,b) => a-b);
-      const clusters = [[xs[0]]];
-      for(let k=1; k<xs.length; k++){
-        const prev = clusters[clusters.length-1];
-        if(xs[k] - prev[prev.length-1] < avgH * 2) prev.push(xs[k]);
-        else clusters.push([xs[k]]);
+    // 2. Кластеризация X всех items + классификация каждой колонки.
+    // Берём X-начала ВСЕХ items (не только числовых), группируем в
+    // кластеры (gap ≥ 2 × avgH → новый). Затем для каждого кластера
+    // смотрим что в нём преимущественно лежит.
+    const allXs = items.map(it => it.transform[4]).sort((a,b) => a-b);
+    const colStarts = [];
+    if(allXs.length) {
+      colStarts.push(allXs[0]);
+      for(let k = 1; k < allXs.length; k++) {
+        if(allXs[k] - allXs[k-1] >= avgH * 2) colStarts.push(allXs[k]);
       }
-      for(const c of clusters) {
-        if(c.length >= 3) { numColStart = c[0]; break; }
-      }
-      // Страховка — если почему-то не нашлось кластера ≥ 3, берём минимум
-      if(numColStart == null) numColStart = xs[0];
     }
+    // Функция: к какой колонке отнести item с X=x
+    function colOf(x){
+      let best = 0;
+      for(let c = 0; c < colStarts.length; c++) {
+        if(x >= colStarts[c] - avgH * 0.5) best = c;
+        else break;
+      }
+      return best;
+    }
+    // Классифицируем каждую колонку по её содержимому по всей странице.
+    const NUM_PURE = /^\s*\(?-?[\d][\d \u00a0,.]{0,}\)?\s*$/;
+    const colKinds = colStarts.map((_, ci) => {
+      const bucket = items.filter(it => colOf(it.transform[4]) === ci);
+      if(!bucket.length) return 'desc';
+      let numeric = 0, rsbu = 0, note = 0, big = 0, text = 0;
+      for(const it of bucket) {
+        const s = (it.str || '').trim();
+        if(!s) continue;
+        if(NUM_PURE.test(s)) {
+          numeric++;
+          const cleaned = s.replace(/[()\s,\u00a0]/g,'').replace(/^\-/,'');
+          const n = parseInt(cleaned, 10);
+          if(!isNaN(n)) {
+            if(RSBU_CODE_SET && RSBU_CODE_SET.has(n)) rsbu++;
+            else if(n >= 1 && n <= 99 && Number.isInteger(parseFloat(cleaned))) note++;
+            else big++;
+          } else big++;
+        } else text++;
+      }
+      if(numeric < text) return 'desc';
+      if(rsbu > numeric * 0.5) return 'code';
+      if(note > numeric * 0.6 && big < numeric * 0.3) return 'note';
+      return 'value';
+    });
 
-    // 3. Формируем строки
+    // 3. Сборка строк: items идут в нужные «ведра» согласно типу колонки.
     for(const [, lineItems] of linesOrdered) {
       lineItems.sort((a,b) => a.transform[4] - b.transform[4]);
-      const descItems = [];
-      const valItems  = [];
-      for(const it of lineItems) {
-        if(numColStart != null && it.transform[4] >= numColStart - avgH * 0.3) {
-          valItems.push(it);
-        } else {
-          descItems.push(it);
-        }
-      }
-
-      // Описание — один кусок. Любой неотрицательный gap между items
-      // превращаем в пробел (чтобы слова не слипались).
       let desc = '';
-      let prevXEnd = null;
-      for(const it of descItems) {
+      let prevDescEnd = null;
+      const valueCells = new Map(); // colIdx → текст ячейки
+      for(const it of lineItems) {
         const x = it.transform[4], w = it.width || 0;
-        if(prevXEnd != null && x >= prevXEnd && desc && !desc.endsWith(' ')) {
-          desc += ' ';
+        const c = colOf(x);
+        const kind = colKinds[c] || 'desc';
+        const s = it.str || '';
+        if(kind === 'desc') {
+          if(prevDescEnd != null && x >= prevDescEnd && desc && !desc.endsWith(' ')) desc += ' ';
+          desc += s;
+          prevDescEnd = x + w;
+        } else if(kind === 'value') {
+          const prev = valueCells.get(c) || '';
+          valueCells.set(c, prev ? (prev.endsWith(' ') ? prev + s : prev + ' ' + s) : s);
         }
-        desc += it.str;
-        prevXEnd = x + w;
+        // 'note' / 'code' — игнорируем полностью.
       }
       desc = desc.replace(/\s+/g,' ').trim();
-
-      // Значения — ячейки по X-gap > 1.5 × avgH, внутри ячейки пробел
-      // между соседями с любым неотрицательным gap (внутричислительный
-      // разделитель тысяч «2 871» уцелеет — regex extractNumbersFromLine
-      // считает ровно ОДИН пробел разделителем тысяч).
-      const cells = [];
-      let curCell = '';
-      prevXEnd = null;
-      for(const it of valItems) {
-        const x = it.transform[4], w = it.width || 0;
-        if(prevXEnd != null) {
-          const gap = x - prevXEnd;
-          if(gap > 1.5 * avgH) {
-            if(curCell.trim()) cells.push(curCell.trim());
-            curCell = '';
-          } else if(gap >= 0 && curCell && !curCell.endsWith(' ')) {
-            curCell += ' ';
-          }
-        }
-        curCell += it.str;
-        prevXEnd = x + w;
-      }
-      if(curCell.trim()) cells.push(curCell.trim());
-
-      if(desc || cells.length) {
-        out += [desc, ...cells].join('\t') + '\n';
+      // Упорядочиваем value-ячейки по X колонки (слева направо).
+      const valCells = [...valueCells.entries()]
+        .sort((a,b) => colStarts[a[0]] - colStarts[b[0]])
+        .map(([,v]) => v.trim())
+        .filter(Boolean);
+      if(desc || valCells.length) {
+        out += [desc, ...valCells].join('\t') + '\n';
       }
     }
     out += '\n';
@@ -1843,43 +1856,41 @@ async function extractPdfTextLines(pdf, maxPages=80) {
 // Выделяет все числа из строки, уважая русский разделитель тысяч (пробел
 // между группами ровно 3 цифр) и НЕ склеивая соседние колонки таблицы.
 // Отрицательные числа в скобках "(1 234)" конвертируются в "-1234".
-function extractNumbersFromLine(line) {
+// Определяет формат чисел в документе. Русский: '1 234 567,89'.
+// Английский: '1,234,567.89'. По умолчанию русский — российские
+// МСФО-отчёты чаще в нём.
+function detectNumberFormat(txt){
+  const enHits = ((txt||'').match(/\d{1,3}(?:,\d{3}){2,}(?:\.\d+)?/g) || []).length;
+  const ruHits = ((txt||'').match(/\d{1,3}(?:[ \u00a0]\d{3}){2,}(?:,\d+)?/g) || []).length;
+  if(enHits > ruHits * 1.5) return { lang:'en', thousands:',', decimal:'.' };
+  return { lang:'ru', thousands:' ', decimal:',' };
+}
+
+// Держим текущий формат в глобале — фьюжн с detectNumberFormat проще
+// чем прокидывать параметр через все findVal в РСБУ-блок.
+let _numFormat = { lang:'ru', thousands:' ', decimal:',' };
+
+function extractNumbersFromLine(line, fmt) {
   if(!line) return [];
-  // Скобочные отрицательные: (1 234) → -1234. Разрешаем пробелы/минус/цифры.
-  line = line.replace(/\(\s*(-?[\d \u00a0]+(?:[.,]\d+)?)\s*\)/g, (m, n) => {
+  const f = fmt || _numFormat || { lang:'ru', thousands:' ', decimal:',' };
+  // Отрицательные в скобках → префикс минус.
+  line = line.replace(/\(\s*(-?[\d \u00a0,.]+)\s*\)/g, (m, n) => {
     return '-' + n.replace(/[\s\u00a0]/g,'');
   });
-  // Число либо с разделителями тысяч (1-3 цифры + хотя бы одна группа
-  // " 3 цифры"), либо монолитное (4+ цифр или дробное). Для обоих случаев
-  // опциональный знак минус.
-  const RE = /-?(?:\d{1,3}(?:[ \u00a0]\d{3})+|\d+)(?:[.,]\d+)?/g;
+  const RE = f.lang === 'en'
+    ? /-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?/g
+    : /-?(?:\d{1,3}(?:[ \u00a0]\d{3})+|\d+)(?:[.,]\d+)?/g;
   const out = [];
   let m;
   while((m = RE.exec(line)) !== null) {
-    const raw = m[0].replace(/[ \u00a0]/g,'').replace(',','.');
+    let raw = m[0];
+    if(f.lang === 'en') raw = raw.replace(/,/g,'');
+    else raw = raw.replace(/[ \u00a0]/g,'').replace(',','.');
     const n = parseFloat(raw);
     if(!isNaN(n)) out.push(n);
   }
   return out;
 }
-
-// Известные коды строк РСБУ (форма 1 — баланс, форма 2 — ОФР). Для них
-// парсер может ошибочно принять сам код за значение, если в строке PDF
-// пропадёт значение справа от кода. Используется в findVal ниже для
-// защиты при выборе «значащего» числа.
-const RSBU_CODE_SET = new Set([
-  // форма 1 (баланс): активы
-  1110,1120,1130,1140,1150,1160,1170,1180,1190,1100,
-  1210,1220,1230,1240,1250,1260,1200,1600,
-  // форма 1: пассивы
-  1310,1320,1340,1350,1360,1370,1300,
-  1410,1420,1430,1450,1400,
-  1510,1520,1530,1540,1550,1500,
-  1700,
-  // форма 2: ОФР
-  2110,2120,2100,2210,2220,2200,2310,2320,2330,2340,2350,2300,
-  2410,2421,2460,2400,2510,2520,2500,
-]);
 
 // Фильтрует шум: годы (1000–2999 как 4-значные целые) и РСБУ-коды.
 // Дополнительно: выбирает «значащее» число из строки. Первый элемент в
@@ -5218,10 +5229,10 @@ function detectScaleByText(txt){
 
 function repFillFromText(rawText, scaleOverride){
   const txt = rawText || '';
+  // Определяем формат чисел (рус/англ) и сохраняем в глобал, чтобы
+  // extractNumbersFromLine и filter-ы работали корректно для обоих.
+  _numFormat = detectNumberFormat(txt);
 
-  // Сначала ищем значения в сыром виде (scale=1), потом выбираем
-  // реальный scale двумя путями: текст + величина чисел. Пользователь
-  // может вручную задать scaleOverride.
   let scale = 1;
 
   const sources = {};
