@@ -1699,12 +1699,17 @@ async function refreshAllPrices() {
 // repExtractPdf/repFillFromText (вкладка «Отчётность»).
 // ══════════════════════════════════════════════════════
 
-// Достаёт текст PDF с сохранением строк и колонок таблиц. pdf.js даёт
-// TextContent-item'ы в storage-order (не обязательно в порядке чтения),
-// поэтому мы сначала группируем их по Y (строки), потом внутри каждой
-// строки сортируем по X. Между соседними item'ами на одной строке
-// ставим один пробел (разделитель тысяч / слов) или несколько — если
-// между ними большой горизонтальный разрыв (значит это колонка таблицы).
+// Извлекает текст PDF как ТАБЛИЦУ. Каждая логическая строка документа
+// — строка с ячейками, разделёнными символом \t. Это позволяет findVal
+// чётко отделить «описание показателя» (первая ячейка) от «значений»
+// (следующие ячейки — колонки периодов).
+//
+// Почему это надёжнее чем просто текст: в числе «2 871» (разделитель
+// тысяч) pdf.js даёт два item-а «2» и «871», между ними маленький gap.
+// Если вставлять между item-ами на одной строке один пробел, получается
+// «2 871» — число целиком. А колонки таблицы разделены большим gap,
+// тогда ставим \t — парсер не воспримет соседнее «107 626» как
+// продолжение разделителя тысяч числа «2 871».
 async function extractPdfTextLines(pdf, maxPages=80) {
   let out = '';
   const pages = Math.min(pdf.numPages, maxPages);
@@ -1716,18 +1721,17 @@ async function extractPdfTextLines(pdf, maxPages=80) {
     const items = (content.items || []).filter(it => (it.str||'').length);
     if(!items.length) { out += '\n'; continue; }
 
-    // Средняя высота шрифта — для расчёта порогов Y-группировки и X-gap.
     const heights = items.map(it => it.height || Math.abs((it.transform||[])[3]) || 12);
     const avgH = heights.reduce((a,b)=>a+b,0) / heights.length || 12;
-    const yTol = Math.max(1.5, avgH * 0.4); // tolerance для «одной строки»
+    const yTol = Math.max(1.5, avgH * 0.55);       // толерантность одной строки по Y
+    const cellGapK = 1.2;                          // > 1.2 × H → граница ячейки
 
-    // Группируем items по Y (с толерантностью yTol). Ключ — округлённый Y.
+    // Группируем items по Y (с толерантностью).
     const byLine = new Map();
     for(const it of items) {
       const tr = it.transform || [];
       const y = tr[5];
       if(y == null) continue;
-      // Ищем уже существующую линию с близким Y
       let bucketKey = null;
       for(const k of byLine.keys()) {
         if(Math.abs(k - y) <= yTol) { bucketKey = k; break; }
@@ -1737,11 +1741,10 @@ async function extractPdfTextLines(pdf, maxPages=80) {
       byLine.get(bucketKey).push(it);
     }
 
-    // Сортируем строки сверху вниз: в PDF координата Y растёт вверх.
+    // Строки — сверху вниз (в PDF Y растёт вверх).
     const lines = [...byLine.entries()].sort((a,b) => b[0] - a[0]);
 
     for(const [, lineItems] of lines) {
-      // Внутри строки — слева направо.
       lineItems.sort((a,b) => (a.transform?.[4]||0) - (b.transform?.[4]||0));
       let line = '';
       let prevXEnd = null;
@@ -1752,17 +1755,20 @@ async function extractPdfTextLines(pdf, maxPages=80) {
         const s = (it.str || '');
         if(prevXEnd !== null && x !== null) {
           const gap = x - prevXEnd;
-          if(gap > avgH * 0.4) {
-            // Колонка таблицы / явный разрыв — несколько пробелов.
-            line += '   ';
-          } else if(line && !line.endsWith(' ')) {
+          if(gap > avgH * cellGapK) {
+            // Большой горизонтальный разрыв — это граница ячейки таблицы.
+            // Ставим TAB. Несколько подряд идущих TAB-ов нормально — это
+            // пустые ячейки.
+            line += '\t';
+          } else if(gap > 0.1 && line && !/[\s\t]$/.test(line)) {
+            // Нормальный словесный/внутричисельный разрыв — один пробел.
             line += ' ';
           }
         }
         line += s;
         if(x !== null) prevXEnd = x + w;
       }
-      if(line.trim()) out += line.trim() + '\n';
+      if(line.trim()) out += line.replace(/[ \t]+$/,'').replace(/^[ \t]+/,'') + '\n';
     }
     out += '\n';
   }
@@ -1888,15 +1894,29 @@ async function parseAnyReport(input) {
 
     // Ищем число на строке с ключом. НЕ трогаем исходный текст глобально —
     // это сохраняет границы таблиц, где колонки разделены пробелами.
+    // Таблично-ориентированный поиск. Строка — ячейки через \t; первая
+    // ячейка = описание, остальные = колонки (номер примечания + периоды).
+    // Собираем первое число из каждой ячейки-колонки; возвращаем первое
+    // число с |n| ≥ 100 (т.е. пропускаем одноцифровой номер примечания).
     function findVal(patterns) {
       const lines = txt.split('\n');
       for (const pat of patterns) {
         const re = new RegExp(pat, 'i');
         for (const line of lines) {
-          if(!re.test(line)) continue;
-          const nums = filterMeaningfulNumbers(extractNumbersFromLine(line), {minAbs: 1});
-          const v = pickPrimaryNumber(nums);
-          if (v != null) return v; // левая колонка = текущий период
+          const cells = line.split('\t');
+          const desc = cells[0] || '';
+          const matchInDesc = re.test(desc);
+          const matchInLine = matchInDesc || re.test(line);
+          if(!matchInLine) continue;
+          const candidates = [];
+          for(let i = matchInDesc ? 1 : 0; i < cells.length; i++){
+            const cell = cells[i]; if(!cell || !cell.trim()) continue;
+            const nums = filterMeaningfulNumbers(extractNumbersFromLine(cell), {minAbs: 1});
+            if(nums.length) candidates.push(nums[0]);
+          }
+          if(!candidates.length) continue;
+          const big = candidates.find(n => Math.abs(n) >= 100);
+          return big != null ? big : candidates[0];
         }
       }
       return null;
@@ -1920,19 +1940,19 @@ async function parseAnyReport(input) {
     const sc = v => v !== null ? parseFloat((v * scale).toFixed(6)) : null;
     const alreadyFilled = new Set(Object.keys(codeResults).filter(k=>codeResults[k]!=null));
     const fields = {
-      'is-rev':    alreadyFilled.has('is-rev')    ? null : sc(findVal(['Выручка по договорам','Выручка от реализации','Итого выручк\\w*','^\\s*Выручка\\b','Доходы от реализации','Revenue'])),
+      'is-rev':    alreadyFilled.has('is-rev')    ? null : sc(findVal(['Выручка по договорам','Выручка от реализации','Итого выручк[а-яё]*','^\\s*Выручка\\b','Доходы от реализации','Revenue'])),
       'is-ebitda': sc(findVal(['EBITDA','Прибыль до вычета процентов','ЕБИТДА'])),
       'is-ebit':   alreadyFilled.has('is-ebit')   ? null : sc(findVal(['Операционная прибыль','Прибыль от продаж','EBIT'])),
       'is-np':     alreadyFilled.has('is-np')     ? null : sc(findVal(['Чистая прибыль','Итого чистая прибыль','Прибыль за период','Прибыль за отчетн','Net profit','Profit for the period'])),
       'is-int':    alreadyFilled.has('is-int')    ? null : sc(findVal(['Проценты к уплате','Процентные расходы','Расходы по процентам','Финансовые расходы','Finance costs'])),
       'is-tax':    alreadyFilled.has('is-tax')    ? null : sc(findVal(['Налог на прибыль','Расход по налогу','Income tax'])),
       'is-assets': alreadyFilled.has('is-assets') ? null : sc(findVal(['Итого активы','Итого активов','Совокупные активы','Всего активов','Total assets','ИТОГО АКТИВЫ','БАЛАНС'])),
-      'is-ca':     alreadyFilled.has('is-ca')     ? null : sc(findVal(['Итого оборотн\\w*\\s+активов','Итого оборотных','Оборотные активы','Total current assets','Current assets'])),
-      'is-cl':     alreadyFilled.has('is-cl')     ? null : sc(findVal(['Итого краткосрочн\\w*\\s+обязательств','Итого краткосрочных','Краткосрочные обязательства','Total current liabilities','Current liabilities'])),
+      'is-ca':     alreadyFilled.has('is-ca')     ? null : sc(findVal(['Итого оборотн[а-яё]*\\s+активов','Итого оборотных','Оборотные активы','Total current assets','Current assets'])),
+      'is-cl':     alreadyFilled.has('is-cl')     ? null : sc(findVal(['Итого краткосрочн[а-яё]*\\s+обязательств','Итого краткосрочных','Краткосрочные обязательства','Total current liabilities','Current liabilities'])),
       'is-debt':   alreadyFilled.has('is-debt')   ? null : sc(findVal(['Заемные средства','Кредиты и займы','Total borrowings','Долгосрочные займы'])),
       'is-cash':   alreadyFilled.has('is-cash')   ? null : sc(findVal(['Денежные средства и (их )?эквивалент','Cash and cash equivalents','ДС и их эквивалент'])),
       'is-ret':    alreadyFilled.has('is-ret')    ? null : sc(findVal(['Нераспредел[её]нная прибыль','Retained earnings'])),
-      'is-eq':     alreadyFilled.has('is-eq')     ? null : sc(findVal(['Итого капитал','Итого собственн\\w*\\s+капитал','Собственный капитал','Total equity','ИТОГО КАПИТАЛ'])),
+      'is-eq':     alreadyFilled.has('is-eq')     ? null : sc(findVal(['Итого капитал','Итого собственн[а-яё]*\\s+капитал','Собственный капитал','Total equity','ИТОГО КАПИТАЛ'])),
     };
     const labels = {
       'is-rev':'Выручка','is-ebitda':'EBITDA','is-ebit':'EBIT','is-np':'Чистая прибыль',
@@ -5029,13 +5049,22 @@ function repFillFromText(rawText){
     for(const pat of patterns){
       const re = new RegExp(pat, 'i');
       for(const line of lines){
-        if(!re.test(line)) continue;
-        const nums = filterMeaningfulNumbers(extractNumbersFromLine(line), {minAbs: 1});
-        const v = pickPrimaryNumber(nums);
-        if(v!=null) {
-          if(traceId) sources[traceId] = {line: line.trim(), value: v, pattern: pat};
-          return v;
+        const cells = line.split('\t');
+        const desc = cells[0] || '';
+        const matchInDesc = re.test(desc);
+        const matchInLine = matchInDesc || re.test(line);
+        if(!matchInLine) continue;
+        const candidates = [];
+        for(let i = matchInDesc ? 1 : 0; i < cells.length; i++){
+          const cell = cells[i]; if(!cell || !cell.trim()) continue;
+          const nums = filterMeaningfulNumbers(extractNumbersFromLine(cell), {minAbs:1});
+          if(nums.length) candidates.push(nums[0]);
         }
+        if(!candidates.length) continue;
+        const big = candidates.find(n => Math.abs(n) >= 100);
+        const v = big != null ? big : candidates[0];
+        if(traceId) sources[traceId] = {line: line.replace(/\t/g,' | ').trim(), value: v, pattern: pat};
+        return v;
       }
     }
     return null;
@@ -5044,18 +5073,18 @@ function repFillFromText(rawText){
   const sc=v=>v!=null?parseFloat((v*scale).toFixed(6)):null;
 
   const map={
-    'rep-np-rev':   sc(findValTrace(['Выручка по договорам','Выручка от реализации','Итого выручк\\w*','^\\s*Выручка\\b','Доходы от реализации','Revenue'], 'rep-np-rev')),
+    'rep-np-rev':   sc(findValTrace(['Выручка по договорам','Выручка от реализации','Итого выручк[а-яё]*','^\\s*Выручка\\b','Доходы от реализации','Revenue'], 'rep-np-rev')),
     'rep-np-ebitda':sc(findValTrace(['EBITDA','Прибыль до вычета процентов','ЕБИТДА'], 'rep-np-ebitda')),
     'rep-np-ebit':  sc(findValTrace(['Операционная прибыль','Прибыль от продаж','EBIT'], 'rep-np-ebit')),
     'rep-np-np':    sc(findValTrace(['Чистая прибыль','Итого чистая прибыль','Прибыль за период','Прибыль за отчетн','Net profit','Profit for the period'], 'rep-np-np')),
     'rep-np-int':   sc(findValTrace(['Проценты к уплате','Процентные расходы','Расходы по процентам','Финансовые расходы','Finance costs'], 'rep-np-int')),
     'rep-np-assets':sc(findValTrace(['Итого активы','Итого активов','Совокупные активы','Всего активов','Total assets','ИТОГО АКТИВЫ','БАЛАНС'], 'rep-np-assets')),
-    'rep-np-ca':    sc(findValTrace(['Итого оборотн\\w*\\s+активов','Итого оборотных','Оборотные активы','Total current assets','Current assets'], 'rep-np-ca')),
-    'rep-np-cl':    sc(findValTrace(['Итого краткосрочн\\w*\\s+обязательств','Итого краткосрочных','Краткосрочные обязательства','Total current liabilities','Current liabilities'], 'rep-np-cl')),
+    'rep-np-ca':    sc(findValTrace(['Итого оборотн[а-яё]*\\s+активов','Итого оборотных','Оборотные активы','Total current assets','Current assets'], 'rep-np-ca')),
+    'rep-np-cl':    sc(findValTrace(['Итого краткосрочн[а-яё]*\\s+обязательств','Итого краткосрочных','Краткосрочные обязательства','Total current liabilities','Current liabilities'], 'rep-np-cl')),
     'rep-np-debt':  sc(findValTrace(['Заемные средства','Кредиты и займы','Total borrowings'], 'rep-np-debt')),
     'rep-np-cash':  sc(findValTrace(['Денежные средства и (их )?эквивалент','Cash and cash equivalents','ДС и их эквивалент'], 'rep-np-cash')),
     'rep-np-ret':   sc(findValTrace(['Нераспредел[её]нная прибыль','Retained earnings'], 'rep-np-ret')),
-    'rep-np-eq':    sc(findValTrace(['Итого капитал','Итого собственн\\w*\\s+капитал','Собственный капитал','Total equity','ИТОГО КАПИТАЛ'], 'rep-np-eq')),
+    'rep-np-eq':    sc(findValTrace(['Итого капитал','Итого собственн[а-яё]*\\s+капитал','Собственный капитал','Total equity','ИТОГО КАПИТАЛ'], 'rep-np-eq')),
   };
   const log=document.getElementById('rep-np-parse-log');
   const labels = {
