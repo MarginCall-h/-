@@ -1699,17 +1699,16 @@ async function refreshAllPrices() {
 // repExtractPdf/repFillFromText (вкладка «Отчётность»).
 // ══════════════════════════════════════════════════════
 
-// Извлекает текст PDF как ТАБЛИЦУ. Каждая логическая строка документа
-// — строка с ячейками, разделёнными символом \t. Это позволяет findVal
-// чётко отделить «описание показателя» (первая ячейка) от «значений»
-// (следующие ячейки — колонки периодов).
-//
-// Почему это надёжнее чем просто текст: в числе «2 871» (разделитель
-// тысяч) pdf.js даёт два item-а «2» и «871», между ними маленький gap.
-// Если вставлять между item-ами на одной строке один пробел, получается
-// «2 871» — число целиком. А колонки таблицы разделены большим gap,
-// тогда ставим \t — парсер не воспримет соседнее «107 626» как
-// продолжение разделителя тысяч числа «2 871».
+// Извлекает текст PDF с сохранением порядка чтения:
+//   1) items группируются в строки по Y (с толерантностью).
+//   2) Внутри строки — сортируются по X (слева направо).
+//   3) Между соседними items на одной строке вставляется:
+//      • пустая строка если gap ~ 0 (слитный текст),
+//      • один пробел при маленьком gap (словесный разрыв или разделитель
+//        тысяч в числе «2 871»),
+//      • 3 пробела при большом gap (колонка таблицы) — это не даёт
+//        extractNumbersFromLine склеить «2 871» и «107 626» в одно число
+//        (regex требует ровно ОДИН пробел как разделитель тысяч).
 async function extractPdfTextLines(pdf, maxPages=80) {
   let out = '';
   const pages = Math.min(pdf.numPages, maxPages);
@@ -1718,57 +1717,50 @@ async function extractPdfTextLines(pdf, maxPages=80) {
     try { page = await pdf.getPage(i); } catch(e){ continue; }
     let content;
     try { content = await page.getTextContent(); } catch(e){ continue; }
-    const items = (content.items || []).filter(it => (it.str||'').length);
+    const items = (content.items || []).filter(it => (it.str||'').length && it.transform);
     if(!items.length) { out += '\n'; continue; }
 
-    const heights = items.map(it => it.height || Math.abs((it.transform||[])[3]) || 12);
+    const heights = items.map(it => it.height || Math.abs(it.transform[3]) || 12);
     const avgH = heights.reduce((a,b)=>a+b,0) / heights.length || 12;
-    const yTol = Math.max(1.5, avgH * 0.55);       // толерантность одной строки по Y
-    const cellGapK = 1.2;                          // > 1.2 × H → граница ячейки
+    const yTol = Math.max(1.5, avgH * 0.55);
+    const colGapK = 1.8; // gap > 1.8 × H — считаем «колонкой» (3 пробела)
 
-    // Группируем items по Y (с толерантностью).
     const byLine = new Map();
     for(const it of items) {
-      const tr = it.transform || [];
-      const y = tr[5];
-      if(y == null) continue;
-      let bucketKey = null;
+      const y = it.transform[5];
+      let key = null;
       for(const k of byLine.keys()) {
-        if(Math.abs(k - y) <= yTol) { bucketKey = k; break; }
+        if(Math.abs(k - y) <= yTol) { key = k; break; }
       }
-      if(bucketKey == null) bucketKey = y;
-      if(!byLine.has(bucketKey)) byLine.set(bucketKey, []);
-      byLine.get(bucketKey).push(it);
+      if(key == null) key = y;
+      if(!byLine.has(key)) byLine.set(key, []);
+      byLine.get(key).push(it);
     }
-
-    // Строки — сверху вниз (в PDF Y растёт вверх).
     const lines = [...byLine.entries()].sort((a,b) => b[0] - a[0]);
 
     for(const [, lineItems] of lines) {
-      lineItems.sort((a,b) => (a.transform?.[4]||0) - (b.transform?.[4]||0));
+      lineItems.sort((a,b) => a.transform[4] - b.transform[4]);
       let line = '';
       let prevXEnd = null;
       for(const it of lineItems) {
-        const tr = it.transform || [];
-        const x = tr[4];
+        const x = it.transform[4];
         const w = it.width || 0;
-        const s = (it.str || '');
-        if(prevXEnd !== null && x !== null) {
+        const s = it.str || '';
+        if(prevXEnd !== null) {
           const gap = x - prevXEnd;
-          if(gap > avgH * cellGapK) {
-            // Большой горизонтальный разрыв — это граница ячейки таблицы.
-            // Ставим TAB. Несколько подряд идущих TAB-ов нормально — это
-            // пустые ячейки.
-            line += '\t';
-          } else if(gap > 0.1 && line && !/[\s\t]$/.test(line)) {
-            // Нормальный словесный/внутричисельный разрыв — один пробел.
-            line += ' ';
+          if(gap > avgH * colGapK) {
+            // Колонка — 3 пробела (ломает разделитель тысяч).
+            line += '   ';
+          } else if(gap > 0.3 * avgH) {
+            // Словесный разрыв / разделитель тысяч — один пробел.
+            if(line && !line.endsWith(' ')) line += ' ';
           }
+          // gap ≈ 0 — слитный текст, без вставки пробела.
         }
         line += s;
-        if(x !== null) prevXEnd = x + w;
+        prevXEnd = x + w;
       }
-      if(line.trim()) out += line.replace(/[ \t]+$/,'').replace(/^[ \t]+/,'') + '\n';
+      if(line.trim()) out += line.trim() + '\n';
     }
     out += '\n';
   }
@@ -1894,29 +1886,19 @@ async function parseAnyReport(input) {
 
     // Ищем число на строке с ключом. НЕ трогаем исходный текст глобально —
     // это сохраняет границы таблиц, где колонки разделены пробелами.
-    // Таблично-ориентированный поиск. Строка — ячейки через \t; первая
-    // ячейка = описание, остальные = колонки (номер примечания + периоды).
-    // Собираем первое число из каждой ячейки-колонки; возвращаем первое
-    // число с |n| ≥ 100 (т.е. пропускаем одноцифровой номер примечания).
+    // Поиск значения на строке. Между колонками стоит 3 пробела, которые
+    // НЕ являются разделителем тысяч, так что extractNumbersFromLine даст
+    // отдельные числа для соседних колонок. pickPrimaryNumber пропустит
+    // маленькие префиксы (номера примечаний < 100).
     function findVal(patterns) {
       const lines = txt.split('\n');
       for (const pat of patterns) {
         const re = new RegExp(pat, 'i');
         for (const line of lines) {
-          const cells = line.split('\t');
-          const desc = cells[0] || '';
-          const matchInDesc = re.test(desc);
-          const matchInLine = matchInDesc || re.test(line);
-          if(!matchInLine) continue;
-          const candidates = [];
-          for(let i = matchInDesc ? 1 : 0; i < cells.length; i++){
-            const cell = cells[i]; if(!cell || !cell.trim()) continue;
-            const nums = filterMeaningfulNumbers(extractNumbersFromLine(cell), {minAbs: 1});
-            if(nums.length) candidates.push(nums[0]);
-          }
-          if(!candidates.length) continue;
-          const big = candidates.find(n => Math.abs(n) >= 100);
-          return big != null ? big : candidates[0];
+          if(!re.test(line)) continue;
+          const nums = filterMeaningfulNumbers(extractNumbersFromLine(line), {minAbs: 1});
+          const v = pickPrimaryNumber(nums);
+          if(v != null) return v;
         }
       }
       return null;
@@ -5049,22 +5031,13 @@ function repFillFromText(rawText){
     for(const pat of patterns){
       const re = new RegExp(pat, 'i');
       for(const line of lines){
-        const cells = line.split('\t');
-        const desc = cells[0] || '';
-        const matchInDesc = re.test(desc);
-        const matchInLine = matchInDesc || re.test(line);
-        if(!matchInLine) continue;
-        const candidates = [];
-        for(let i = matchInDesc ? 1 : 0; i < cells.length; i++){
-          const cell = cells[i]; if(!cell || !cell.trim()) continue;
-          const nums = filterMeaningfulNumbers(extractNumbersFromLine(cell), {minAbs:1});
-          if(nums.length) candidates.push(nums[0]);
+        if(!re.test(line)) continue;
+        const nums = filterMeaningfulNumbers(extractNumbersFromLine(line), {minAbs:1});
+        const v = pickPrimaryNumber(nums);
+        if(v != null){
+          if(traceId) sources[traceId] = {line: line.trim(), value: v, pattern: pat};
+          return v;
         }
-        if(!candidates.length) continue;
-        const big = candidates.find(n => Math.abs(n) >= 100);
-        const v = big != null ? big : candidates[0];
-        if(traceId) sources[traceId] = {line: line.replace(/\t/g,' | ').trim(), value: v, pattern: pat};
-        return v;
       }
     }
     return null;
