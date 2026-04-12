@@ -1100,6 +1100,7 @@ tr:hover td{background:var(--s2)}
     </div>
     <button class="btn btn-sm btn-p" onclick="repNewIssuerModal()">＋ Эмитент</button>
     <button class="btn btn-sm" id="rep-add-period-btn" style="display:none" onclick="repNewPeriodModal()">＋ Добавить период</button>
+    <button class="btn btn-sm" id="rep-pdf-btn" style="display:none;border-color:var(--acc);color:var(--acc)" onclick="repUploadFileShortcut()" title="Прочитать PDF/DOCX/XLSX отчёт и создать период автоматически">📂 Загрузить PDF</button>
     <div style="margin-left:auto;display:flex;gap:6px">
       <button class="btn btn-sm" id="rep-compare-btn" style="display:none" onclick="repShowCompare()">⇄ Сравнить периоды</button>
       <button class="btn btn-sm" id="rep-del-issuer-btn" style="display:none;border-color:var(--danger);color:var(--danger)" onclick="repDeleteIssuer()">🗑 Удалить эмитента</button>
@@ -4273,6 +4274,7 @@ function repSelectIssuer(){
     document.getElementById('rep-issuer-view').style.display='none';
     document.getElementById('rep-compare-btn').style.display='none';
     document.getElementById('rep-add-period-btn').style.display='none';
+    document.getElementById('rep-pdf-btn').style.display='none';
     document.getElementById('rep-del-issuer-btn').style.display='none';
     return;
   }
@@ -4281,6 +4283,7 @@ function repSelectIssuer(){
   document.getElementById('rep-issuer-view').style.display='block';
   document.getElementById('rep-compare-view').style.display='none';
   document.getElementById('rep-add-period-btn').style.display='';
+  document.getElementById('rep-pdf-btn').style.display='';
   document.getElementById('rep-del-issuer-btn').style.display='';
   repBuildPeriodTabs();
 }
@@ -4397,56 +4400,135 @@ function repRenderText(p, iss){
 }
 
 function repRenderCharts(iss){
+  const area = document.getElementById('rep-chart-area');
   const periods = Object.entries(iss.periods||{}).sort((a,b)=>a[0].localeCompare(b[0]));
   if(periods.length<2){
-    document.getElementById('rep-chart-area').innerHTML=`<div class="empty"><div class="ei">📈</div><p>Добавьте минимум 2 периода для графика динамики</p></div>`;
+    area.innerHTML=`<div class="empty"><div class="ei">📈</div><p>Нужно минимум 2 периода для сравнения динамики</p></div>`;
     return;
   }
-  const labels = periods.map(([k,p])=>`${p.year} ${p.period}`);
+
+  // Метрики: higher=true — рост хорошо (зелёный), higher=false — рост плохо (красный).
   const metrics = [
-    {key:'rev', label:'Выручка', color:'#00d4ff'},
-    {key:'ebitda', label:'EBITDA', color:'#22d3a0'},
-    {key:'np', label:'Чист. прибыль', color:'#a78bfa'},
-    {key:'debt', label:'Долг', color:'#ff4d6d'},
+    {key:'rev',    label:'Выручка',              higher:true},
+    {key:'ebitda', label:'EBITDA',               higher:true},
+    {key:'ebit',   label:'EBIT',                 higher:true},
+    {key:'np',     label:'Чистая прибыль',       higher:true},
+    {key:'assets', label:'Активы',               higher:true},
+    {key:'eq',     label:'Собственный капитал',  higher:true},
+    {key:'cash',   label:'Денежные средства',    higher:true},
+    {key:'ret',    label:'Нераспр. прибыль',     higher:true},
+    {key:'debt',   label:'Долг',                 higher:false},
+    {key:'int',    label:'Процентные расходы',   higher:false},
+    {key:'cl',     label:'Краткосрочные обяз.',  higher:false},
+    {key:'ca',     label:'Оборотные активы',     higher:true},
   ];
 
-  const charts = metrics.filter(m=>periods.some(([,p])=>p[m.key]!=null)).map(m=>{
-    const vals = periods.map(([,p])=>p[m.key]??null);
-    const max = Math.max(...vals.filter(v=>v!=null));
-    const min = Math.min(0,...vals.filter(v=>v!=null));
-    const range = max-min||1;
-    const W=320, H=100, PAD=30;
-    const pts = vals.map((v,i)=>{
-      const x = PAD + (i/(periods.length-1||1))*(W-PAD*2);
-      const y = H - PAD - ((v-min)/range)*(H-PAD*2);
-      return `${x},${y}`;
-    }).join(' ');
-    const dots = vals.map((v,i)=>{
-      if(v==null) return '';
-      const x = PAD + (i/(periods.length-1||1))*(W-PAD*2);
-      const y = H - PAD - ((v-min)/range)*(H-PAD*2);
-      return `<circle cx="${x}" cy="${y}" r="3.5" fill="${m.color}"/>
-              <title>${labels[i]}: ${v} млрд</title>`;
-    }).join('');
-    const xlabels = labels.map((l,i)=>{
-      const x = PAD + (i/(periods.length-1||1))*(W-PAD*2);
-      return `<text x="${x}" y="${H-5}" font-size="7" fill="#3a6080" text-anchor="middle">${l}</text>`;
-    }).join('');
-    const ylabels = [min,max].map((v,i)=>{
-      const y = i===0?H-PAD:PAD+5;
-      return `<text x="4" y="${y}" font-size="7" fill="#3a6080">${v.toFixed(0)}</text>`;
-    }).join('');
+  const fmtV = v => v==null ? '—' : v.toLocaleString('ru-RU',{maximumFractionDigits:2}) + ' млрд';
+  const sign = n => n>0 ? '+' : '';
 
-    return `<div style="background:var(--s1);border:1px solid var(--border);padding:12px;display:inline-block;margin:0 8px 8px 0">
-      <div style="font-size:.6rem;color:${m.color};letter-spacing:.08em;margin-bottom:6px">${m.label}, млрд ₽</div>
-      <svg width="${W}" height="${H}" style="display:block">
-        <polyline points="${pts}" fill="none" stroke="${m.color}" stroke-width="2" opacity=".8"/>
-        ${dots}${xlabels}${ylabels}
-      </svg>
+  // Строим карточку-пару для двух соседних периодов
+  function pairCard(prev, curr){
+    const [ka,pa] = prev;
+    const [kb,pb] = curr;
+    const headerL = `${pa.year} ${pa.period} ${pa.type}`;
+    const headerR = `${pb.year} ${pb.period} ${pb.type}`;
+
+    const rows = metrics.map(m=>{
+      const a = pa[m.key], b = pb[m.key];
+      if(a==null || b==null) return '';
+      // Знак изменения в процентах. Если база ≈ 0, отдаём n/a.
+      let pct = null, dir = 'flat';
+      if(Math.abs(a) > 1e-9){
+        pct = (b - a) / Math.abs(a) * 100;
+        if(pct >  0.5) dir = 'up';
+        else if(pct < -0.5) dir = 'down';
+      } else if(b !== 0){
+        dir = b > 0 ? 'up' : 'down'; // с нуля — только направление
+      }
+
+      // Цвет: учитываем что для debt/int/cl рост = плохо.
+      const good = dir==='up' ? m.higher : (dir==='down' ? !m.higher : null);
+      const color = good===null ? 'var(--text2)' : good ? 'var(--green)' : 'var(--danger)';
+      const arrow = dir==='up' ? '▲' : dir==='down' ? '▼' : '—';
+
+      // Полоса: ширина ∝ min(|Δ%|, 100%), со знаком слева/справа от центра.
+      const pctClamped = pct==null ? 0 : Math.max(-100, Math.min(100, pct));
+      const w = Math.abs(pctClamped); // 0..100
+      const barHtml = pct==null ? '' : `
+        <div style="position:relative;height:6px;background:var(--border);margin-top:5px">
+          <div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:var(--text3);opacity:.5"></div>
+          ${pctClamped>=0
+            ? `<div style="position:absolute;left:50%;top:0;bottom:0;width:${w/2}%;background:${color};opacity:.65"></div>`
+            : `<div style="position:absolute;right:50%;top:0;bottom:0;width:${w/2}%;background:${color};opacity:.65"></div>`}
+        </div>`;
+
+      const pctText = pct==null ? 'н/д' : `${sign(pct)}${pct.toFixed(1)}%`;
+
+      return `<div style="padding:10px 0;border-bottom:1px solid rgba(30,48,72,.4)">
+        <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:3px">
+          <span style="font-size:.72rem;font-weight:600;color:var(--text);min-width:160px">${m.label}</span>
+          <span style="font-size:.64rem;color:var(--text3);margin-left:auto;font-variant-numeric:tabular-nums">${fmtV(a)} → ${fmtV(b)}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:.78rem;font-weight:700;color:${color};min-width:80px">${arrow} ${pctText}</span>
+          <div style="flex:1;min-width:40px">${barHtml}</div>
+        </div>
+      </div>`;
+    }).filter(Boolean).join('');
+
+    // Сводка по производным коэффициентам (ND/EBITDA, ICR, Equity Ratio, маржа)
+    const ra = repCalcRatios(pa), rb = repCalcRatios(pb);
+    const ratioRow = (label, va, vb, unit, betterHigher) => {
+      if(va==null || vb==null) return '';
+      const a = parseFloat(va), b = parseFloat(vb);
+      const diff = b - a;
+      const abs = Math.abs(a) > 1e-9 ? (diff/Math.abs(a)*100) : null;
+      const dir = Math.abs(diff) < 0.005 ? 'flat' : diff > 0 ? 'up' : 'down';
+      const good = dir==='up' ? betterHigher : (dir==='down' ? !betterHigher : null);
+      const color = good===null ? 'var(--text2)' : good ? 'var(--green)' : 'var(--danger)';
+      const arrow = dir==='up' ? '▲' : dir==='down' ? '▼' : '—';
+      return `<div style="display:flex;align-items:baseline;gap:10px;padding:6px 0;border-bottom:1px dashed rgba(30,48,72,.4);font-size:.68rem">
+        <span style="color:var(--text2);min-width:140px">${label}</span>
+        <span style="color:var(--text);font-variant-numeric:tabular-nums">${a.toFixed(2)}${unit} → ${b.toFixed(2)}${unit}</span>
+        <span style="color:${color};margin-left:auto;font-weight:600">${arrow} ${diff>0?'+':''}${diff.toFixed(2)}${unit}${abs!=null?` (${abs>0?'+':''}${abs.toFixed(1)}%)`:''}</span>
+      </div>`;
+    };
+
+    const ratios = [
+      ratioRow('ND/EBITDA',      ra.ndE,    rb.ndE,    'x', false),
+      ratioRow('ICR (покрытие)', ra.icr,    rb.icr,    'x', true),
+      ratioRow('Current Ratio',  ra.cur,    rb.cur,    'x', true),
+      ratioRow('EBITDA маржа',   ra.ebitdam,rb.ebitdam,'%', true),
+      ratioRow('Чист. маржа',    ra.npm,    rb.npm,    '%', true),
+      ratioRow('Equity Ratio',   ra.eqr,    rb.eqr,    '%', true),
+    ].filter(Boolean).join('');
+
+    return `<div class="card" style="margin-bottom:14px">
+      <div class="card-hdr">
+        <span style="color:var(--text2);font-size:.67rem">${headerL}</span>
+        <span style="color:var(--text3);margin:0 6px">→</span>
+        <span style="color:var(--acc);font-size:.67rem">${headerR}</span>
+      </div>
+      <div class="card-body">
+        ${rows || '<div style="color:var(--text3);font-size:.7rem;padding:6px 0">Нет перекрывающихся числовых полей для расчёта динамики.</div>'}
+        ${ratios ? `
+          <div style="font-size:.57rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text3);margin:14px 0 6px">Производные коэффициенты</div>
+          ${ratios}` : ''}
+      </div>
     </div>`;
-  }).join('');
+  }
 
-  document.getElementById('rep-chart-area').innerHTML = `<div style="overflow-x:auto;white-space:nowrap">${charts}</div>`;
+  const cards = [];
+  for(let i=0; i<periods.length-1; i++){
+    cards.push(pairCard(periods[i], periods[i+1]));
+  }
+
+  area.innerHTML = `
+    <div style="font-size:.6rem;color:var(--text3);margin-bottom:10px">
+      Сравнение между соседними периодами. ${periods.length>2?'Несколько пар — сверху старые, снизу свежие.':''} Цвет учитывает знак: рост долга — красный, рост выручки — зелёный.
+    </div>
+    ${cards.join('')}
+  `;
 }
 
 function repRenderAnalysis(p, iss){
@@ -4572,6 +4654,19 @@ function repDeleteIssuer(){
   save(); repInit();
   document.getElementById('rep-issuer-view').style.display='none';
   document.getElementById('rep-empty').style.display='block';
+}
+
+// Прямой shortcut для загрузки PDF: открывает ту же модалку создания
+// периода, но сразу триггерит файловый диалог — пользователю не нужно
+// искать кнопку внутри формы. После парсинга он только выбирает
+// год/период/тип и жмёт «Сохранить».
+function repUploadFileShortcut(){
+  if(!repActiveIssuerId){ alert('Сначала выберите эмитента'); return; }
+  repNewPeriodModal();
+  setTimeout(()=>{
+    const f = document.getElementById('rep-np-file');
+    if(f) f.click();
+  }, 120);
 }
 
 function repNewPeriodModal(){
