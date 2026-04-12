@@ -3538,6 +3538,101 @@ if(savedVersion < PORTFOLIO_VERSION){
   save();
 }
 
+// ══════════════════════════════════════════════════════
+// Pre-load reportsDB — seed отчётности эмитентов из портфеля.
+// Цифры взяты из реальных публичных отчётов МСФО (smart-lab.ru агрегирует
+// консолидированную отчётность эмитентов MOEX; ГТЛК и АБЗ-1 — из PDF
+// МСФО с сайтов эмитентов). Все значения в млрд ₽.
+// Эмитенты без цифр — в базу добавлены только как карточки (загрузите
+// официальный PDF-отчёт через «📂 PDF/DOCX/XLSX» на вкладке «Эмитент»).
+// ══════════════════════════════════════════════════════
+const REPORTS_SEED_VERSION = 1;
+const savedRepVersion = parseInt(localStorage.getItem('ba_reports_seed_ver')||'0');
+if(savedRepVersion < REPORTS_SEED_VERSION){
+  localStorage.setItem('ba_reports_seed_ver', REPORTS_SEED_VERSION);
+  const SRC_SL = name => `Источник: smart-lab.ru/q/${name}/f/y/MSFO/ (консолид. МСФО эмитента MOEX).`;
+  const SRC_GTLK = 'Источник: gtlk.ru/investors (Консолидир. МСФО за 2024 г., PDF).';
+  const SRC_ABZ  = 'Источник: abz-1.ru (Консолидир. МСФО за 2024 г., PDF, апр. 2025).';
+  const NO_DATA_NOTE = 'Цифры не подтянуты автоматически (403/503 на корп. сайте и e-disclosure.ru). Загрузите PDF отчёта через кнопку «📂 PDF/DOCX/XLSX» на вкладке «Эмитент».';
+  const REPORTS_SEED = [
+    // ═══ С данными (10 эмитентов) ═══
+    {name:'Аэрофлот', ind:'transport', note:SRC_SL('AFLT'), periods:[
+      {year:'2023', period:'Год', type:'МСФО', rev:612.2, ebitda:318.4, ebit:182.3, np:-1.03, int:29.2, assets:1114,  eq:-85.5, debt:747.3, cash:117.0, ca:null, cl:null, ret:null},
+      {year:'2024', period:'Год', type:'МСФО', rev:856.8, ebitda:214.1, ebit:99.5,  np:64.2,  int:23.1, assets:1157,  eq:-55.7, debt:703.0, cash:105.4, ca:null, cl:null, ret:null},
+    ]},
+    {name:'Газпром', ind:'energy', note:SRC_SL('GAZP'), periods:[
+      {year:'2023', period:'Год', type:'МСФО', rev:8542,  ebitda:1765,  ebit:-364,  np:726,   int:396.8,assets:28714, eq:15650, debt:6657,  cash:1602,  ca:null, cl:null, ret:null},
+      {year:'2024', period:'Год', type:'МСФО', rev:10715, ebitda:3108,  ebit:1456,  np:1461,  int:715.4,assets:30698, eq:16711, debt:6715,  cash:992,   ca:null, cl:null, ret:null},
+    ]},
+    {name:'АФК Система', ind:'other', note:SRC_SL('AFKS'), periods:[
+      {year:'2023', period:'Год', type:'МСФО', rev:1046,  ebitda:263.5, ebit:115.5, np:-31.5, int:130.3,assets:2349,  eq:66.3,  debt:1199,  cash:137.5, ca:null, cl:null, ret:null},
+      {year:'2024', period:'Год', type:'МСФО', rev:1232,  ebitda:317.7, ebit:167.0, np:-25.6, int:252.9,assets:2761,  eq:13.5,  debt:1485,  cash:157.9, ca:null, cl:null, ret:null},
+    ]},
+    {name:'КАМАЗ', ind:'other', note:SRC_SL('KMAZ'), periods:[
+      {year:'2023', period:'Год', type:'МСФО', rev:370.3, ebitda:34.4,  ebit:28.9,  np:19.7,  int:8.84, assets:468.3, eq:114.8, debt:144.0, cash:91.6,  ca:null, cl:null, ret:null},
+      {year:'2024', period:'Год', type:'МСФО', rev:393.7, ebitda:33.1,  ebit:22.8,  np:-0.2,  int:20.7, assets:556.5, eq:118.6, debt:225.6, cash:65.4,  ca:null, cl:null, ret:null},
+    ]},
+    {name:'Селигдар', ind:'metals', note:SRC_SL('SELG'), periods:[
+      {year:'2023', period:'Год', type:'МСФО', rev:56.0,  ebitda:18.6,  ebit:4.93,  np:2.84,  int:4.92, assets:134.9, eq:24.4,  debt:58.8,  cash:10.3,  ca:null, cl:null, ret:null},
+      {year:'2024', period:'Год', type:'МСФО', rev:59.3,  ebitda:23.6,  ebit:12.9,  np:5.50,  int:7.74, assets:179.2, eq:19.4,  debt:89.9,  cash:8.43,  ca:null, cl:null, ret:null},
+    ]},
+    {name:'Группа Позитив', ind:'telecom', note:SRC_SL('POSI'), periods:[
+      {year:'2023', period:'Год', type:'МСФО', rev:22.2,  ebitda:10.8,  ebit:9.82,  np:9.70,  int:0.131,assets:28.4,  eq:13.2,  debt:5.68,  cash:1.68,  ca:null, cl:null, ret:null},
+      {year:'2024', period:'Год', type:'МСФО', rev:24.5,  ebitda:6.46,  ebit:4.62,  np:3.66,  int:0.969,assets:52.7,  eq:17.1,  debt:26.4,  cash:6.23,  ca:null, cl:null, ret:null},
+    ]},
+    {name:'ТГК-14', ind:'energy', note:SRC_SL('TGKN'), periods:[
+      {year:'2023', period:'Год', type:'МСФО', rev:17.8,  ebitda:3.00,  ebit:2.19,  np:1.65,  int:0.560,assets:21.6,  eq:7.66,  debt:8.28,  cash:5.00,  ca:null, cl:null, ret:null},
+      {year:'2024', period:'Год', type:'МСФО', rev:19.3,  ebitda:3.78,  ebit:2.74,  np:1.76,  int:1.12, assets:23.8,  eq:7.10,  debt:9.62,  cash:3.76,  ca:null, cl:null, ret:null},
+    ]},
+    {name:'ТрансКонтейнер', ind:'transport', note:SRC_SL('TRCN'), periods:[
+      {year:'2023', period:'Год', type:'МСФО', rev:199.2, ebitda:42.1,  ebit:null,  np:19.8,  int:11.3, assets:160.7, eq:24.9,  debt:98.4,  cash:7.80,  ca:null, cl:null, ret:null},
+      {year:'2024', period:'Год', type:'МСФО', rev:185.1, ebitda:46.3,  ebit:null,  np:14.2,  int:16.4, assets:168.5, eq:26.3,  debt:98.5,  cash:4.73,  ca:null, cl:null, ret:null},
+    ]},
+    {name:'ГТЛК', ind:'finance', note:SRC_GTLK, periods:[
+      {year:'2023', period:'Год', type:'МСФО', rev:97.4,  ebitda:null,  ebit:14.3,  np:0.7,   int:66.7, assets:1144.7,eq:173.1, debt:840.8, cash:32.2,  ca:null, cl:null, ret:-55.0},
+      {year:'2024', period:'Год', type:'МСФО', rev:133.4, ebitda:null,  ebit:7.5,   np:1.8,   int:110.0,assets:1355.7,eq:205.3, debt:989.7, cash:64.5,  ca:null, cl:null, ret:-53.3},
+    ]},
+    {name:'АБЗ-1', ind:'realty', note:SRC_ABZ, periods:[
+      {year:'2023', period:'Год', type:'МСФО', rev:6.4,   ebitda:1.1,   ebit:0.8,   np:0.6,   int:1.0,  assets:11.7,  eq:2.7,   debt:7.0,   cash:0.9,   ca:10.1, cl:3.6,  ret:2.7},
+      {year:'2024', period:'Год', type:'МСФО', rev:8.2,   ebitda:1.3,   ebit:1.1,   np:0.7,   int:1.2,  assets:12.2,  eq:3.5,   debt:6.2,   cash:1.8,   ca:11.1, cl:5.5,  ret:3.5},
+    ]},
+    // ═══ Без цифр (WebFetch блокируется корп. сайтами / e-disclosure.ru) ═══
+    {name:'РЖД',                         ind:'transport', note:NO_DATA_NOTE, periods:[]},
+    {name:'ПГК',                         ind:'transport', note:NO_DATA_NOTE, periods:[]},
+    {name:'ВИС Финанс',                  ind:'realty',    note:NO_DATA_NOTE, periods:[]},
+    {name:'Авто Финанс Банк',            ind:'finance',   note:NO_DATA_NOTE, periods:[]},
+    {name:'Сэтл Групп',                  ind:'realty',    note:NO_DATA_NOTE, periods:[]},
+    {name:'МФК Кредитный поток',         ind:'finance',   note:NO_DATA_NOTE, periods:[]},
+    {name:'Холдинг СЗ (Село Зелёное)',   ind:'agro',      note:NO_DATA_NOTE, periods:[]},
+    {name:'Биннофарм Групп',             ind:'other',     note:NO_DATA_NOTE, periods:[]},
+    {name:'Арктик Технолоджи',           ind:'energy',    note:NO_DATA_NOTE, periods:[]},
+    {name:'Эконива',                     ind:'agro',      note:NO_DATA_NOTE, periods:[]},
+  ];
+  REPORTS_SEED.forEach(ent => {
+    let issId = Object.keys(reportsDB).find(k => reportsDB[k].name === ent.name);
+    if(!issId){
+      issId = 'iss_seed_' + Math.floor(Math.random()*1e9).toString(36) + '_' + Date.now().toString(36);
+      reportsDB[issId] = {name: ent.name, ind: ent.ind, periods:{}};
+    }
+    ent.periods.forEach(p => {
+      const key = `${p.year}_${p.period||'FY'}_${p.type||'?'}`;
+      if(reportsDB[issId].periods[key]) return; // не перезаписываем то, что ввёл пользователь
+      reportsDB[issId].periods[key] = {
+        year:p.year, period:p.period||'FY', type:p.type||'?',
+        note: ent.note||'',
+        rev:p.rev??null, ebitda:p.ebitda??null, ebit:p.ebit??null, np:p.np??null,
+        int:p.int??null, tax:p.tax??null, assets:p.assets??null, ca:p.ca??null,
+        cl:p.cl??null, debt:p.debt??null, cash:p.cash??null, ret:p.ret??null,
+        eq:p.eq??null,
+        analysisHTML:'',
+      };
+    });
+  });
+  save();
+  const _sbRep = document.getElementById('sb-rep');
+  if(_sbRep) _sbRep.textContent = Object.keys(reportsDB).length;
+}
+
 // Demo YTM bonds if empty
 if(!ytmBonds.length){
   [{name:'ОФЗ 26238',btype:'ОФЗ',ctype:'fix',price:60.5,coupon:7.1,years:15.5},
